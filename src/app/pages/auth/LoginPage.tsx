@@ -25,7 +25,7 @@ function LoginPage() {
           <Building2 className="w-8 h-8 text-white" />
         </div>
         <h1 className="text-3xl font-bold text-white mb-2 tracking-tight">
-          Smart City Admin
+          Smart Surveillance Admin
         </h1>
         <p className="text-blue-200/80 text-sm">
           Manage your city infrastructure intelligently
