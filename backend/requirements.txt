@@ -1,0 +1,27 @@
+Flask==3.0.3
+Flask-Cors==4.0.1
+deepface==0.0.99
+
+# Numeric/vision stack (kept explicit to reduce resolver drift)
+numpy==2.4.4
+opencv-python==4.13.0.92
+Pillow==12.1.1
+pandas==2.2.3
+matplotlib==3.10.8
+
+# Detection engines
+ultralytics==8.2.0
+torch==2.11.0
+torchvision==0.26.0
+
+# DeepFace runtime
+tensorflow-cpu==2.20.0
+tf-keras==2.20.1
+
+# YOLOv5 torch-hub path dependencies
+GitPython==3.1.46
+seaborn==0.13.2
+
+# WSGI servers
+waitress==3.0.2
+gunicorn==25.1.0
