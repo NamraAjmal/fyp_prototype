@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Re-enrollment script: regenerate face encodings using the current model (ArcFace).
+Re-enrollment script: regenerate face encodings using the current model.
 This is needed when upgrading from one model to another.
 """
 import os
 import numpy as np
 import json
 from app import (
-    BASE_DIR, UPLOAD_FOLDER, MODEL_NAME, ENCODING_DTYPE,
+    UPLOAD_FOLDER, ENCODING_DTYPE,
     normalize, get_single_embedding, logger
 )
+
+MODEL_NAME = "InsightFace-buffalo_l"
 
 def reenroll_resident(cnic):
     """Re-generate face encodings for a single resident using the current model."""
@@ -79,7 +81,16 @@ def reenroll_all():
         print("No uploads folder found")
         return
     
-    residents = [d for d in os.listdir(UPLOAD_FOLDER) if os.path.isdir(os.path.join(UPLOAD_FOLDER, d)) and not d.startswith('temp')]
+    residents = []
+    for d in os.listdir(UPLOAD_FOLDER):
+        folder_path = os.path.join(UPLOAD_FOLDER, d)
+        if not os.path.isdir(folder_path) or d.startswith('temp'):
+            continue
+        if d in {'helmet_detections', 'mask_detections'}:
+            continue
+        if not os.path.exists(os.path.join(folder_path, 'profile_data.json')):
+            continue
+        residents.append(d)
     
     if not residents:
         print("No residents to re-enroll")

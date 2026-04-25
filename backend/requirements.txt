@@ -1,6 +1,8 @@
 Flask==3.0.3
 Flask-Cors==4.0.1
 deepface==0.0.99
+python-dotenv==1.0.1
+supabase==2.15.3
 
 # Numeric/vision stack (kept explicit to reduce resolver drift)
 numpy==2.4.4

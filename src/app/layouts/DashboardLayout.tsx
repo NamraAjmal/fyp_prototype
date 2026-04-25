@@ -21,7 +21,11 @@ function DashboardLayout() {
 
   const menuItems = [
     { path: "/dashboard", label: "Home", icon: Home },
-    { path: "/dashboard/face-detection", label: "Face Detection", icon: Scan },
+    {
+      path: "/dashboard/face-detection",
+      label: "Face Recognition",
+      icon: Scan,
+    },
     {
       path: "/dashboard/helmet-detection",
       label: "Helmet Detection",
@@ -35,7 +39,7 @@ function DashboardLayout() {
   ];
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
+    <div className="min-h-screen bg-linear-to-br from-slate-50 to-blue-50 text-slate-900">
       {/* Top Navigation Bar */}
       <nav className="bg-white/80 backdrop-blur-xl border-b border-slate-200/50 sticky top-0 z-50 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -53,7 +57,7 @@ function DashboardLayout() {
                 )}
               </button>
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-teal-500 flex items-center justify-center shadow-lg">
+                <div className="w-10 h-10 rounded-xl bg-linear-to-br from-blue-500 to-teal-500 flex items-center justify-center shadow-lg">
                   <Building2 className="w-5 h-5 text-white" />
                 </div>
                 <div className="hidden sm:block">
@@ -81,11 +85,11 @@ function DashboardLayout() {
               ))}
             </div>
 
-            {/* Theme Toggle and Logout */}
+            {/* Logout */}
             <div className="flex items-center gap-2">
               <button
                 onClick={handleLogout}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gradient-to-r from-red-500 to-pink-500 text-white hover:shadow-lg transition-all duration-300 hover:scale-105"
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-linear-to-r from-red-500 to-pink-500 text-white hover:shadow-lg transition-all duration-300 hover:scale-105"
               >
                 <LogOut className="w-4 h-4" />
                 <span className="hidden sm:inline">Logout</span>
@@ -110,7 +114,7 @@ function DashboardLayout() {
         >
           <div className="p-6">
             <div className="flex items-center gap-3 mb-8">
-              <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500 to-teal-500 flex items-center justify-center shadow-lg">
+              <div className="w-12 h-12 rounded-xl bg-linear-to-br from-blue-500 to-teal-500 flex items-center justify-center shadow-lg">
                 <Building2 className="w-6 h-6 text-white" />
               </div>
               <div>

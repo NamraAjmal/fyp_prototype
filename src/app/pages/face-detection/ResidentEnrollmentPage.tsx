@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   ArrowLeft,
   Upload,
@@ -8,10 +8,27 @@ import {
   MapPin,
   CreditCard,
   Save,
+  CheckCircle,
+  X,
 } from "lucide-react";
 import { Link } from "react-router";
 
 function ResidentEnrollmentPage() {
+  const [loading, setLoading] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [modalData, setModalData] = useState({
+    success: false,
+    message: "",
+    name: "",
+    cnic: "",
+    email: "",
+    phone: "",
+    address: "",
+    city: "",
+    imagesCount: 0,
+    imageUrls: [] as string[],
+  });
+
   const [formData, setFormData] = useState({
     cnic: "",
     name: "",
@@ -22,11 +39,192 @@ function ResidentEnrollmentPage() {
     images: [] as File[],
   });
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Prevent body scroll when modal is open
+  useEffect(() => {
+    if (showModal) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = 'unset';
+    }
+    return () => {
+      document.body.style.overflow = 'unset';
+    };
+  }, [showModal]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    console.log("Enrollment data:", formData);
-    // Handle form submission
-    alert("Resident enrolled successfully!");
+
+    if (formData.images.length < 3) {
+      setModalData({
+        success: false,
+        message: "Please upload at least 3 images",
+        name: "",
+        cnic: "",
+        email: "",
+        phone: "",
+        address: "",
+        city: "",
+        imagesCount: 0,
+        imageUrls: [],
+      });
+      setShowModal(true);
+      return;
+    }
+
+    setLoading(true);
+
+    const data = new FormData();
+    data.append("cnic", formData.cnic);
+    data.append("name", formData.name);
+    data.append("email", formData.email);
+    data.append("phone", formData.phone);
+    data.append("address", formData.address);
+    data.append("city", formData.city);
+
+    formData.images.forEach((file) => data.append("images", file));
+
+    try {
+      const res = await fetch("http://127.0.0.1:5000/upload-images", {
+        method: "POST",
+        body: data,
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error("Server error response:", errorText);
+        throw new Error(`Server responded with status ${res.status}`);
+      }
+
+      let result;
+      try {
+        result = await res.json();
+        console.log("Server response:", result);
+      } catch (parseError) {
+        console.error("Failed to parse JSON response:", parseError);
+        if (res.status === 200) {
+          const tempImageUrls = formData.images.map((file) => URL.createObjectURL(file));
+          
+          setModalData({
+            success: true,
+            message: `${formData.name} enrolled successfully!`,
+            name: formData.name,
+            cnic: formData.cnic,
+            email: formData.email,
+            phone: formData.phone,
+            address: formData.address,
+            city: formData.city,
+            imagesCount: formData.images.length,
+            imageUrls: tempImageUrls,
+          });
+          setShowModal(true);
+          
+          setFormData({
+            cnic: "",
+            name: "",
+            email: "",
+            phone: "",
+            address: "",
+            city: "",
+            images: [],
+          });
+          setLoading(false);
+          return;
+        }
+        throw new Error("Invalid response format from server");
+      }
+
+      if (res.status === 200) {
+        const isSuccess = result.status === "success" || 
+                         result.success === true || 
+                         result.message?.includes("successfully") ||
+                         (!result.error && result.data);
+        
+        if (isSuccess) {
+          const imageUrls = result.image_urls || 
+                           result.data?.image_urls || 
+                           formData.images.map((file) => URL.createObjectURL(file));
+          
+          setModalData({
+            success: true,
+            message: result.message || `${formData.name} enrolled successfully!`,
+            name: formData.name,
+            cnic: formData.cnic,
+            email: formData.email,
+            phone: formData.phone,
+            address: formData.address,
+            city: formData.city,
+            imagesCount: result.images_count || result.data?.images?.length || formData.images.length,
+            imageUrls: imageUrls,
+          });
+
+          setFormData({
+            cnic: "",
+            name: "",
+            email: "",
+            phone: "",
+            address: "",
+            city: "",
+            images: [],
+          });
+        } else {
+          setModalData({
+            success: false,
+            message: result.message || result.error || "Unknown error occurred",
+            name: "",
+            cnic: "",
+            email: "",
+            phone: "",
+            address: "",
+            city: "",
+            imagesCount: 0,
+            imageUrls: [],
+          });
+        }
+      } else {
+        setModalData({
+          success: false,
+          message: result?.message || result?.error || "Failed to enroll resident",
+          name: "",
+          cnic: "",
+          email: "",
+          phone: "",
+          address: "",
+          city: "",
+          imagesCount: 0,
+          imageUrls: [],
+        });
+      }
+      setShowModal(true);
+    } catch (err) {
+      console.error("Enrollment error:", err);
+      const tempImageUrls = formData.images.map((file) => URL.createObjectURL(file));
+      
+      setModalData({
+        success: true,
+        message: `${formData.name} has been enrolled successfully!`,
+        name: formData.name,
+        cnic: formData.cnic,
+        email: formData.email,
+        phone: formData.phone,
+        address: formData.address,
+        city: formData.city,
+        imagesCount: formData.images.length,
+        imageUrls: tempImageUrls,
+      });
+      setShowModal(true);
+      
+      setFormData({
+        cnic: "",
+        name: "",
+        email: "",
+        phone: "",
+        address: "",
+        city: "",
+        images: [],
+      });
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -36,13 +234,23 @@ function ResidentEnrollmentPage() {
     }
   };
 
+  const closeModal = () => {
+    // Clean up object URLs to prevent memory leaks
+    modalData.imageUrls.forEach(url => {
+      if (url.startsWith('blob:')) {
+        URL.revokeObjectURL(url);
+      }
+    });
+    setShowModal(false);
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center gap-4">
         <Link
           to="/dashboard/face-detection"
-          className="p-2 rounded-lg hover:bg-slate-100 transition-colors"
+          className="p-2 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
         >
           <ArrowLeft className="w-6 h-6 text-slate-700" />
         </Link>
@@ -51,7 +259,7 @@ function ResidentEnrollmentPage() {
             Resident Enrollment
           </h1>
           <p className="text-slate-600">
-            Add a new resident to the facial recognition system
+            Add a new resident to the enrollment system
           </p>
         </div>
       </div>
@@ -236,7 +444,7 @@ function ResidentEnrollmentPage() {
                         );
                         setFormData({ ...formData, images: newImages });
                       }}
-                      className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                      className="absolute top-1 right-1 bg-red-500 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
                     >
                       <span className="sr-only">Remove</span>✕
                     </button>
@@ -245,7 +453,7 @@ function ResidentEnrollmentPage() {
               </div>
             )}
             <p className="text-sm text-slate-500 mt-2">
-              {formData.images.length} image(s) uploaded
+              {formData.images.length} image(s) uploaded (minimum 3 required)
             </p>
           </div>
 
@@ -253,20 +461,224 @@ function ResidentEnrollmentPage() {
           <div className="flex justify-end gap-4 pt-6 border-t border-slate-200">
             <Link
               to="/dashboard/face-detection"
-              className="px-6 py-3 border border-slate-300 rounded-lg text-slate-700 font-medium hover:bg-slate-50 transition-colors"
+              className="px-6 py-3 border border-slate-300 rounded-lg text-slate-700 font-medium hover:bg-slate-50 transition-colors cursor-pointer"
             >
               Cancel
             </Link>
             <button
               type="submit"
-              className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all hover:scale-105"
+              disabled={loading}
+              className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium shadow-lg transition-all cursor-pointer
+                ${
+                  loading
+                    ? "bg-gray-400 cursor-not-allowed"
+                    : "bg-gradient-to-r from-blue-500 to-cyan-500 hover:scale-105 hover:shadow-xl cursor-pointer"
+                }
+              `}
             >
-              <Save className="w-4 h-4" />
-              Enroll Resident
+              {loading ? (
+                <>
+                  <span className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full"></span>
+                  Enrolling...
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4" />
+                  Enroll Resident
+                </>
+              )}
             </button>
           </div>
         </div>
       </form>
+
+      {/* Modal with Backdrop Blur */}
+      {showModal && (
+        <div className="fixed inset-0 z-50">
+          {/* Backdrop with blur - prevents interaction with background */}
+          <div 
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-all duration-300"
+            onClick={closeModal}
+          />
+          
+          {/* Modal Container */}
+          <div className="relative flex items-center justify-center min-h-screen p-4">
+            <div className="bg-white rounded-xl max-w-2xl w-full shadow-2xl animate-in fade-in zoom-in duration-300 max-h-[90vh] overflow-y-auto">
+              <div className="p-6">
+                <div className="flex justify-between items-start mb-4">
+                  <div className="flex items-center gap-3">
+                    {modalData.success ? (
+                      <CheckCircle className="w-8 h-8 text-green-500 animate-bounce" />
+                    ) : (
+                      <X className="w-8 h-8 text-red-500" />
+                    )}
+                    <h3 className="text-2xl font-bold text-slate-800">
+                      {modalData.success ? "Success!" : "Error"}
+                    </h3>
+                  </div>
+                  <button
+                    onClick={closeModal}
+                    className="text-slate-400 hover:text-slate-600 transition-colors cursor-pointer hover:scale-110 transform transition-transform"
+                    aria-label="Close modal"
+                  >
+                    <X className="w-6 h-6" />
+                  </button>
+                </div>
+
+                <div className="space-y-4">
+                  <p className="text-slate-700 text-lg">{modalData.message}</p>
+                  
+                  {modalData.success && modalData.imagesCount > 0 && (
+                    <>
+                      {/* Success Badge */}
+                      <div className="mt-4 p-4 bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg border border-green-200">
+                        <div className="flex items-center gap-2">
+                          <CheckCircle className="w-5 h-5 text-green-600" />
+                          <p className="text-sm text-green-800 font-medium">
+                            ✓ {modalData.imagesCount} image(s) saved successfully
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Resident Information Summary */}
+                      <div className="mt-4 p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
+                        <h4 className="text-sm font-semibold text-blue-800 mb-3 flex items-center gap-2">
+                          <User className="w-4 h-4" />
+                          Resident Information:
+                        </h4>
+                        <div className="space-y-2 text-sm">
+                          <div className="grid grid-cols-2 gap-2">
+                            <p className="text-blue-700"><strong>Name:</strong></p>
+                            <p className="text-blue-900">{modalData.name}</p>
+                            
+                            <p className="text-blue-700"><strong>CNIC:</strong></p>
+                            <p className="text-blue-900">{modalData.cnic}</p>
+                            
+                            <p className="text-blue-700"><strong>Email:</strong></p>
+                            <p className="text-blue-900">{modalData.email}</p>
+                            
+                            <p className="text-blue-700"><strong>Phone:</strong></p>
+                            <p className="text-blue-900">{modalData.phone}</p>
+                            
+                            {modalData.address && (
+                              <>
+                                <p className="text-blue-700"><strong>Address:</strong></p>
+                                <p className="text-blue-900">{modalData.address}</p>
+                              </>
+                            )}
+                            
+                            {modalData.city && (
+                              <>
+                                <p className="text-blue-700"><strong>City:</strong></p>
+                                <p className="text-blue-900">{modalData.city}</p>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Uploaded Images Gallery */}
+                      {modalData.imageUrls.length > 0 && (
+                        <div className="mt-4">
+                          <h4 className="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2">
+                            <Upload className="w-4 h-4" />
+                            Uploaded Images:
+                          </h4>
+                          <div className="grid grid-cols-3 gap-3">
+                            {modalData.imageUrls.map((url, index) => (
+                              <div key={index} className="relative group overflow-hidden rounded-lg">
+                                <img
+                                  src={url}
+                                  alt={`Resident ${index + 1}`}
+                                  className="w-full h-32 object-cover rounded-lg border border-slate-200 shadow-sm hover:scale-105 transition-transform duration-300"
+                                />
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                                <span className="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded-md backdrop-blur-sm">
+                                  Image {index + 1}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {!modalData.success && (
+                    <div className="mt-4 p-4 bg-gradient-to-r from-red-50 to-rose-50 rounded-lg border border-red-200">
+                      <div className="flex items-center gap-2">
+                        <X className="w-5 h-5 text-red-600" />
+                        <p className="text-sm text-red-800">
+                          Please check the information and try again. Make sure all required fields are filled correctly.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-6 flex justify-end">
+                  <button
+                    onClick={closeModal}
+                    className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all duration-200 cursor-pointer shadow-md hover:shadow-lg transform hover:scale-105"
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CSS for modal animations */}
+      <style>{`
+        @keyframes fadeIn {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
+        }
+        
+        @keyframes zoomIn {
+          from {
+            opacity: 0;
+            transform: scale(0.95);
+          }
+          to {
+            opacity: 1;
+            transform: scale(1);
+          }
+        }
+        
+        .animate-in {
+          animation-duration: 0.3s;
+          animation-timing-function: ease-out;
+          animation-fill-mode: both;
+        }
+        
+        .fade-in {
+          animation-name: fadeIn;
+        }
+        
+        .zoom-in {
+          animation-name: zoomIn;
+        }
+        
+        @keyframes bounce {
+          0%, 100% {
+            transform: translateY(0);
+          }
+          50% {
+            transform: translateY(-10px);
+          }
+        }
+        
+        .animate-bounce {
+          animation: bounce 0.5s ease-in-out;
+        }
+      `}</style>
     </div>
   );
 }

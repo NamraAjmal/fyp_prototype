@@ -1,7 +1,34 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { Camera, BarChart3, ArrowRight } from "lucide-react";
+import {
+  fetchHelmetSummary,
+  type HelmetSummary,
+} from "../../services/helmetApi";
 
 function HelmetDetectionPage() {
+  const [summary, setSummary] = useState<HelmetSummary>({
+    total_detections: 0,
+    compliant: 0,
+    violations: 0,
+    avg_confidence: 0,
+    compliance_rate: 0,
+    no_person_detections: 0,
+  });
+
+  useEffect(() => {
+    const loadSummary = async () => {
+      try {
+        const data = await fetchHelmetSummary();
+        setSummary(data);
+      } catch {
+        // Keep default values if backend is unavailable.
+      }
+    };
+
+    loadSummary();
+  }, []);
+
   const features = [
     {
       title: "Image/Capture",
@@ -27,7 +54,7 @@ function HelmetDetectionPage() {
           Helmet Detection System
         </h1>
         <p className="text-slate-600">
-          Monitor construction site safety and helmet compliance in real-time
+          Monitor worker safety and helmet compliance in real-time
         </p>
       </div>
 
@@ -40,12 +67,12 @@ function HelmetDetectionPage() {
             className="group relative bg-white rounded-xl p-6 shadow-md border border-slate-200/50 hover:shadow-xl transition-all duration-300 hover:scale-[1.02] overflow-hidden"
           >
             <div
-              className={`absolute inset-0 bg-gradient-to-br ${feature.color} opacity-0 group-hover:opacity-10 transition-opacity`}
+              className={`absolute inset-0 bg-linear-to-br ${feature.color} opacity-0 group-hover:opacity-10 transition-opacity`}
             ></div>
 
             <div className="relative z-10">
               <div
-                className={`inline-flex p-3 rounded-xl bg-gradient-to-br ${feature.color} mb-4 shadow-lg`}
+                className={`inline-flex p-3 rounded-xl bg-linear-to-br ${feature.color} mb-4 shadow-lg`}
               >
                 <feature.icon className="w-6 h-6 text-white" />
               </div>
@@ -70,21 +97,27 @@ function HelmetDetectionPage() {
           <h3 className="text-sm font-medium text-slate-500 mb-2">
             Total Detections
           </h3>
-          <p className="text-3xl font-bold text-slate-800">856</p>
-          <p className="text-sm text-green-600 mt-1">+8 this week</p>
+          <p className="text-3xl font-bold text-slate-800">
+            {summary.total_detections}
+          </p>
+          <p className="text-sm text-green-600 mt-1">From helmet logs API</p>
         </div>
         <div className="bg-white rounded-xl p-6 shadow-md border border-slate-200/50">
           <h3 className="text-sm font-medium text-slate-500 mb-2">
             Compliance Rate
           </h3>
-          <p className="text-3xl font-bold text-slate-800">94.2%</p>
-          <p className="text-sm text-blue-600 mt-1">+2.3% improvement</p>
+          <p className="text-3xl font-bold text-slate-800">
+            {Number(summary.compliance_rate || 0).toFixed(1)}%
+          </p>
+          <p className="text-sm text-blue-600 mt-1">Live compliance ratio</p>
         </div>
         <div className="bg-white rounded-xl p-6 shadow-md border border-slate-200/50">
           <h3 className="text-sm font-medium text-slate-500 mb-2">
-            Violations Today
+            Violations
           </h3>
-          <p className="text-3xl font-bold text-slate-800">12</p>
+          <p className="text-3xl font-bold text-slate-800">
+            {summary.violations}
+          </p>
           <p className="text-sm text-red-600 mt-1">Requires attention</p>
         </div>
       </div>

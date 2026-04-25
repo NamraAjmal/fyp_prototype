@@ -2,16 +2,16 @@ import { Outlet } from "react-router";
 
 const AuthLayout = () => {
   return (
-    <div className="min-h-screen w-full relative overflow-hidden flex items-center justify-center p-4">
+    <div className="min-h-screen w-full relative overflow-hidden flex items-center justify-center p-4 text-slate-900">
       {/* Animated gradient background */}
-      <div className="absolute inset-0 bg-gradient-to-br from-slate-900 via-blue-900 to-teal-900">
+      <div className="absolute inset-0 bg-linear-to-br from-slate-100 via-blue-100 to-teal-100">
         {/* Animated overlay gradients */}
         <div
-          className="absolute inset-0 bg-gradient-to-tr from-blue-500/10 via-transparent to-teal-500/10 animate-pulse"
+          className="absolute inset-0 bg-linear-to-tr from-blue-500/20 via-transparent to-teal-500/20 animate-pulse"
           style={{ animationDuration: "8s" }}
         ></div>
         <div
-          className="absolute inset-0 bg-gradient-to-bl from-cyan-500/5 via-transparent to-blue-500/5"
+          className="absolute inset-0 bg-linear-to-bl from-cyan-500/15 via-transparent to-blue-500/15"
           style={{ animation: "pulse 6s ease-in-out infinite" }}
         ></div>
       </div>
@@ -20,7 +20,7 @@ const AuthLayout = () => {
       <div className="absolute inset-0 overflow-hidden">
         {/* Grid pattern */}
         <div
-          className="absolute inset-0 opacity-20"
+          className="absolute inset-0 opacity-30"
           style={{
             backgroundImage:
               "linear-gradient(rgba(56, 189, 248, 0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(56, 189, 248, 0.3) 1px, transparent 1px)",
@@ -44,14 +44,14 @@ const AuthLayout = () => {
 
         {/* Abstract city skyline */}
         <div className="absolute bottom-0 left-0 right-0 h-32 opacity-30">
-          <div className="absolute bottom-0 left-[10%] w-16 h-24 bg-gradient-to-t from-blue-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[20%] w-12 h-32 bg-gradient-to-t from-teal-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[30%] w-20 h-20 bg-gradient-to-t from-cyan-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[45%] w-14 h-28 bg-gradient-to-t from-blue-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[55%] w-16 h-24 bg-gradient-to-t from-teal-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[65%] w-10 h-20 bg-gradient-to-t from-cyan-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[75%] w-18 h-32 bg-gradient-to-t from-blue-400/40 to-transparent"></div>
-          <div className="absolute bottom-0 left-[85%] w-12 h-24 bg-gradient-to-t from-teal-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[10%] w-16 h-24 bg-linear-to-t from-blue-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[20%] w-12 h-32 bg-linear-to-t from-teal-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[30%] w-20 h-20 bg-linear-to-t from-cyan-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[45%] w-14 h-28 bg-linear-to-t from-blue-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[55%] w-16 h-24 bg-linear-to-t from-teal-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[65%] w-10 h-20 bg-linear-to-t from-cyan-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[75%] w-18 h-32 bg-linear-to-t from-blue-400/40 to-transparent"></div>
+          <div className="absolute bottom-0 left-[85%] w-12 h-24 bg-linear-to-t from-teal-400/40 to-transparent"></div>
         </div>
       </div>
 
