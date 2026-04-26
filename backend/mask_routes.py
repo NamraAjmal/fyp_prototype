@@ -21,6 +21,96 @@ def register_mask_routes(app, deps):
 
     @app.route('/mask-detect', methods=['POST'])
     def mask_detect():
+        # Check if this is a JSON request (from camera stream) or multipart form (file upload)
+        if request.is_json:
+            # Handle camera stream JSON request
+            data = request.get_json()
+            if not data or 'frame' not in data:
+                return jsonify({"status": "error", "message": "frame is required"}), 400
+
+            location = data.get('location', 'Unknown Site')
+            camera_id = data.get('camera_id', 'cam_01')
+            source = data.get('source', 'stream')
+            temp_path = None
+
+            try:
+                frame_b64 = data['frame']
+                if ',' in frame_b64:
+                    frame_b64 = frame_b64.split(',')[1]
+
+                frame = cv2.imdecode(np.frombuffer(base64.b64decode(frame_b64), dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    return jsonify({"status": "error", "message": "Could not decode frame"}), 400
+
+                temp_path = os.path.join(MASK_UPLOAD_FOLDER, f"mask_stream_{uuid4().hex[:8]}.jpg")
+                cv2.imwrite(temp_path, frame)
+
+                started_at = datetime.utcnow()
+                detection = detect_masks_core(temp_path, mode='stream')
+                processing_ms = (datetime.utcnow() - started_at).total_seconds() * 1000
+
+                # Format detection data for frontend - ensure proper bbox format
+                formatted_detection = _format_detection_for_frontend(detection)
+
+                # ONLY store events that have actual detections (skip "No Persons Detected")
+                if detection['status'] != 'No Persons Detected':
+                    event_signature = (
+                        f"status:{detection['status']}"
+                        f"|persons:{detection['persons']}"
+                        f"|masked:{detection['masked']}"
+                        f"|without_mask:{detection['without_mask']}"
+                        f"|incorrect:{detection['incorrect']}"
+                    )
+
+                    if _should_store_stream_event('mask', camera_id, event_signature):
+                        storage_result = _persist_detection_image('mask', camera_id, detection['annotated_image'])
+
+                        log_entry = {
+                            "id": int(datetime.now().timestamp() * 1000),
+                            "timestamp": datetime.utcnow().isoformat() + 'Z',
+                            "location": location,
+                            "persons": detection["persons"],
+                            "masked": detection["masked"],
+                            "without_mask": detection["without_mask"],
+                            "incorrect": detection["incorrect"],
+                            "status": detection["status"],
+                            "confidence": detection["confidence"],
+                            "file_name": f"stream_{camera_id}",
+                            "source": source,
+                            "camera_id": camera_id,
+                            "processing_ms": round(processing_ms, 2),
+                            "annotated_image": detection["annotated_image"],
+                        }
+                        append_mask_log(_attach_storage_result_to_log(log_entry, storage_result))
+                        logger.info(f"Saved stream event to mask_logs: {detection['status']} | sig: {event_signature}")
+                else:
+                    logger.debug(f"Skipping 'No Persons Detected' event for camera {camera_id}")
+
+                return jsonify({
+                    "status": "success",
+                    "data": {
+                        **formatted_detection,
+                        "processing_ms": round(processing_ms, 2),
+                        "camera_id": camera_id,
+                        "timestamp": datetime.utcnow().isoformat() + 'Z',
+                        "file_name": f"stream_{camera_id}",
+                        "source": source,
+                        "id": int(datetime.now().timestamp() * 1000),
+                        "compliance": detection["compliance"],
+                        "detections": formatted_detection.get("detections", [])
+                    }
+                })
+            except Exception as e:
+                logger.exception('mask_detect stream error')
+                return jsonify({"status": "error", "message": str(e)}), 500
+            finally:
+                try:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+
+        # Original file upload handling
         image = request.files.get('image')
         location = request.form.get('location', 'Unknown Site')
         source = request.form.get('source', 'image')
@@ -39,6 +129,10 @@ def register_mask_routes(app, deps):
             detection = detect_masks_core(temp_path, mode='upload')
             processing_ms = (datetime.utcnow() - started_at).total_seconds() * 1000
 
+            # Format detection data for frontend
+            formatted_detection = _format_detection_for_frontend(detection)
+
+            # For manual uploads, always save (user explicitly uploaded the image)
             log_entry = {
                 "id": int(datetime.now().timestamp() * 1000),
                 "timestamp": datetime.utcnow().isoformat() + 'Z',
@@ -61,7 +155,12 @@ def register_mask_routes(app, deps):
             return jsonify({
                 "status": "success",
                 "message": "Mask detection completed",
-                "data": {**log_entry, "compliance": detection["compliance"], "detections": detection["detections"]}
+                "data": {
+                    **log_entry,
+                    "compliance": detection["compliance"],
+                    "detections": formatted_detection.get("detections", []),
+                    "annotated_image": detection["annotated_image"]
+                }
             })
         except Exception as e:
             logger.exception('mask_detect error')
@@ -99,41 +198,53 @@ def register_mask_routes(app, deps):
             detection = detect_masks_core(temp_path, mode='stream')
             processing_ms = (datetime.utcnow() - started_at).total_seconds() * 1000
 
-            if detection['status'] == 'Non-Compliant':
-                event_signature = f"status:{detection['status']}|persons:{detection['persons']}|without_mask:{detection['without_mask']}|incorrect:{detection['incorrect']}"
+            # Format detection data for frontend
+            formatted_detection = _format_detection_for_frontend(detection)
+
+            # ONLY store events that have actual detections (skip "No Persons Detected")
+            if detection['status'] != 'No Persons Detected':
+                event_signature = (
+                    f"status:{detection['status']}"
+                    f"|persons:{detection['persons']}"
+                    f"|masked:{detection['masked']}"
+                    f"|without_mask:{detection['without_mask']}"
+                    f"|incorrect:{detection['incorrect']}"
+                )
                 if _should_store_stream_event('mask', camera_id, event_signature):
                     storage_result = _persist_detection_image('mask', camera_id, detection['annotated_image'])
-                else:
-                    storage_result = None
 
-                log_entry = {
-                    "id": int(datetime.now().timestamp() * 1000),
-                    "timestamp": datetime.utcnow().isoformat() + 'Z',
-                    "location": location,
-                    "persons": detection["persons"],
-                    "masked": detection["masked"],
-                    "without_mask": detection["without_mask"],
-                    "incorrect": detection["incorrect"],
-                    "status": detection["status"],
-                    "confidence": detection["confidence"],
-                    "file_name": f"stream_{camera_id}",
-                    "source": "stream",
-                    "camera_id": camera_id,
-                    "processing_ms": round(processing_ms, 2),
-                    "annotated_image": detection["annotated_image"],
-                }
-                append_mask_log(_attach_storage_result_to_log(log_entry, storage_result))
+                    log_entry = {
+                        "id": int(datetime.now().timestamp() * 1000),
+                        "timestamp": datetime.utcnow().isoformat() + 'Z',
+                        "location": location,
+                        "persons": detection["persons"],
+                        "masked": detection["masked"],
+                        "without_mask": detection["without_mask"],
+                        "incorrect": detection["incorrect"],
+                        "status": detection["status"],
+                        "confidence": detection["confidence"],
+                        "file_name": f"stream_{camera_id}",
+                        "source": "stream",
+                        "camera_id": camera_id,
+                        "processing_ms": round(processing_ms, 2),
+                        "annotated_image": detection["annotated_image"],
+                    }
+                    append_mask_log(_attach_storage_result_to_log(log_entry, storage_result))
+                    logger.info(f"Saved stream event: {detection['status']}")
+            else:
+                logger.debug(f"Skipping 'No Persons Detected' event for camera {camera_id}")
 
             return jsonify({
                 "status": "success",
                 "data": {
-                    **detection,
+                    **formatted_detection,
                     "processing_ms": round(processing_ms, 2),
                     "camera_id": camera_id,
                     "timestamp": datetime.utcnow().isoformat() + 'Z',
                     "file_name": f"stream_{camera_id}",
                     "source": "stream",
                     "id": int(datetime.now().timestamp() * 1000),
+                    "compliance": detection["compliance"]
                 }
             })
         except Exception as e:
@@ -183,6 +294,7 @@ def register_mask_routes(app, deps):
                 "processing_ms": round(processing_ms, 2),
             }
             append_mask_log(log_entry)
+            logger.info(f"Manual mask log saved: {status}")
             return jsonify({"status": "success", "message": "Mask log saved", "data": log_entry})
         except Exception as e:
             logger.exception('create_mask_log error')
@@ -251,3 +363,53 @@ def register_mask_routes(app, deps):
         except Exception as e:
             logger.exception('mask_stats error')
             return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _format_detection_for_frontend(detection):
+    """
+    Format detection data for frontend display with proper bounding box coordinates.
+    Ensures all detections have bbox in [x1, y1, x2, y2] integer format.
+    """
+    formatted = {
+        "persons": detection.get("persons", 0),
+        "masked": detection.get("masked", 0),
+        "without_mask": detection.get("without_mask", 0),
+        "incorrect": detection.get("incorrect", 0),
+        "status": detection.get("status", "No Persons Detected"),
+        "confidence": detection.get("confidence", 0.0),
+        "compliance": detection.get("compliance", False),
+        "annotated_image": detection.get("annotated_image", None),
+        "detections": []
+    }
+
+    # Process detections if they exist
+    raw_detections = detection.get("detections", [])
+
+    for det in raw_detections:
+        formatted_det = {
+            "label": det.get("label", ""),
+            "type": det.get("type", ""),
+            "confidence": det.get("confidence", 0.0),
+            "bbox": None
+        }
+
+        # Format bounding box
+        bbox = det.get("bbox")
+        if bbox:
+            try:
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    formatted_det["bbox"] = [int(float(x)) for x in bbox]
+                elif isinstance(bbox, str):
+                    parts = bbox.split(',')
+                    if len(parts) == 4:
+                        formatted_det["bbox"] = [int(float(x)) for x in parts]
+                elif hasattr(bbox, 'tolist'):
+                    bbox_list = bbox.tolist()
+                    if len(bbox_list) == 4:
+                        formatted_det["bbox"] = [int(x) for x in bbox_list]
+            except Exception:
+                formatted_det["bbox"] = None
+
+        formatted["detections"].append(formatted_det)
+
+    return formatted
