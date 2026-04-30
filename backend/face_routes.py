@@ -38,6 +38,10 @@ def register_face_routes(app, deps):
     _delete_storage_paths_from_supabase = deps["_delete_storage_paths_from_supabase"]
     _update_resident_supabase = deps["_update_resident_supabase"]
     _upload_local_file_to_supabase_storage = deps["_upload_local_file_to_supabase_storage"]
+    _check_enrollment_permission = deps["_check_enrollment_permission"]
+    _check_directory_permission = deps["_check_directory_permission"]
+    _check_delete_permission = deps["_check_delete_permission"]
+    _check_capture_permission = deps["_check_capture_permission"]
 
     # Encoding cache for better performance
     encoding_cache = {
@@ -213,13 +217,49 @@ def register_face_routes(app, deps):
             return ""
         return "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
 
+    def _normalize_embedding_vector(embedding):
+        if embedding is None:
+            return None
+        vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        norm = np.linalg.norm(vec)
+        if norm <= 1e-12:
+            return None
+        return vec / norm
+
+    def _cosine_similarity(vec_a, vec_b):
+        if vec_a is None or vec_b is None:
+            return -1.0
+        return float(np.dot(vec_a, vec_b))
+
+    def _average_hash_from_rgb(image_rgb, hash_size=8):
+        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
+        mean_val = resized.mean()
+        return (resized >= mean_val).astype(np.uint8).flatten()
+
+    def _hamming_distance(hash_a, hash_b):
+        return int(np.count_nonzero(hash_a != hash_b))
+
+    def _company_scope_from_request():
+        role = (request.headers.get('X-User-Role') or '').strip().lower()
+        company_id = (request.headers.get('X-Company-ID') or '').strip()
+        if role and role != 'admin' and company_id:
+            return company_id
+        return None
+
     # ========== ROUTES ==========
     
     @app.route('/recognize-face', methods=['POST'])
     def recognize_face():
+        is_allowed, error_info = _check_capture_permission()
+        if not is_allowed:
+            error_msg, status_code = error_info
+            return jsonify({"status": "error", "message": error_msg}), status_code
+
         image = request.files.get('image')
         source = request.form.get('source', 'image')
         camera_id = request.form.get('camera_id', '')
+        company_id = _company_scope_from_request()
         if image is None or not image.filename:
             return jsonify({"status": "error", "message": "image is required"}), 400
 
@@ -242,6 +282,7 @@ def register_face_routes(app, deps):
                     "source": source,
                     "camera_id": camera_id,
                     "file_name": image.filename,
+                    "company_id": company_id,
                     "annotated_image": "",
                 })
                 return jsonify({
@@ -283,6 +324,7 @@ def register_face_routes(app, deps):
 
             annotated = _draw_recognition_boxes(temp_path, face_results)
             storage_result = _persist_detection_image('face', camera_id or source, annotated)
+            organization_name = (request.headers.get('X-Company-Name') or '').strip() or None
 
             log_timestamp = datetime.utcnow().isoformat() + 'Z'
             for fr in face_results:
@@ -299,6 +341,8 @@ def register_face_routes(app, deps):
                     "source": source,
                     "camera_id": camera_id,
                     "file_name": image.filename,
+                    "company_id": company_id,
+                    "organization_name": (request.headers.get('X-Company-Name') or '').strip() or None,
                     "annotated_image": annotated,
                     "bbox": fr.get("bbox"),
                 }, storage_result))
@@ -326,12 +370,18 @@ def register_face_routes(app, deps):
 
     @app.route('/recognize-face-stream', methods=['POST'])
     def recognize_face_stream():
+        is_allowed, error_info = _check_capture_permission()
+        if not is_allowed:
+            error_msg, status_code = error_info
+            return jsonify({"status": "error", "message": error_msg}), status_code
+
         data = request.get_json()
         if not data or 'frame' not in data:
             return jsonify({"status": "error", "message": "frame is required"}), 400
 
         camera_id = data.get('camera_id', 'cam_01')
         source = data.get('source', 'stream')
+        company_id = _company_scope_from_request()
         temp_path = None
         try:
             frame_b64 = data['frame']
@@ -374,6 +424,7 @@ def register_face_routes(app, deps):
             event_signature = f"faces:{len(face_results)}|matched:{matched_count}|unmatched:{unmatched_count}"
             should_store_event = bool(face_results) and _should_store_stream_event('face', camera_id, event_signature)
             storage_result = _persist_detection_image('face', camera_id, annotated) if should_store_event else None
+            organization_name = (request.headers.get('X-Company-Name') or '').strip() or None
 
             log_timestamp = datetime.utcnow().isoformat() + 'Z'
             if should_store_event:
@@ -391,6 +442,8 @@ def register_face_routes(app, deps):
                         "source": source,
                         "camera_id": camera_id,
                         "file_name": f"stream_{camera_id}",
+                        "company_id": company_id,
+                        "organization_name": organization_name,
                         "annotated_image": annotated,
                         "bbox": fr.get("bbox"),
                     }, storage_result))
@@ -417,7 +470,10 @@ def register_face_routes(app, deps):
     @app.route('/face-logs', methods=['GET'])
     def face_logs():
         try:
-            logs = read_face_logs()
+            logs = read_face_logs(
+                company_id=_company_scope_from_request(),
+                company_name=(request.headers.get('X-Company-Name') or '').strip() or None,
+            )
 
             status_filter = request.args.get('status', 'all')
 
@@ -496,9 +552,18 @@ def register_face_routes(app, deps):
     def upload_images():
         cnic = None
         try:
+            # Permission check: viewers cannot enroll residents
+            is_allowed, error_info = _check_enrollment_permission()
+            if not is_allowed:
+                error_msg, status_code = error_info
+                return jsonify({"status": "error", "message": error_msg}), status_code
+            
             logger.info("=" * 50)
             logger.info("UPLOAD-IMAGES ENDPOINT HIT")
             logger.info("=" * 50)
+
+            organization_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            organization_name = (request.headers.get('X-Company-Name') or '').strip() or None
             
             cnic = request.form.get('cnic')
             name = request.form.get('name')
@@ -529,13 +594,35 @@ def register_face_routes(app, deps):
             resident_folder = os.path.join(UPLOAD_FOLDER, cnic)
             images_folder = os.path.join(resident_folder, 'images')
 
-            if os.path.exists(resident_folder):
-                logger.error(f"Resident folder already exists: {resident_folder}")
+            # Supabase is the source of truth for enrollment existence checks.
+            existing_resident = _read_resident_supabase(cnic)
+            if existing_resident:
+                logger.error(f"CNIC already exists in Supabase: {cnic}")
                 return jsonify({"status": "error", "message": "This CNIC is already enrolled"}), 409
+
+            # Keep writing files locally, but do not block enrollment on stale local folders.
+            if os.path.exists(resident_folder):
+                logger.warning(
+                    f"Stale local folder found without Supabase resident. Removing: {resident_folder}"
+                )
+                shutil.rmtree(resident_folder, ignore_errors=True)
 
             # Create directories
             os.makedirs(images_folder, exist_ok=True)
             logger.info(f"Created folders: {resident_folder}")
+
+            uploaded_storage_paths = []
+
+            def cleanup_and_rollback(message, status_code=400):
+                logger.error(message)
+                shutil.rmtree(resident_folder, ignore_errors=True)
+                if uploaded_storage_paths:
+                    try:
+                        _delete_storage_paths_from_supabase(uploaded_storage_paths)
+                    except Exception as storage_cleanup_err:
+                        logger.warning(f"Failed storage cleanup: {str(storage_cleanup_err)}")
+                _delete_resident_supabase(cnic)
+                return jsonify({"status": "error", "message": message}), status_code
 
             # Create resident record in Supabase
             profile_data = {
@@ -545,6 +632,8 @@ def register_face_routes(app, deps):
                 "phone": phone,
                 "address": address,
                 "city": city,
+                "organization_id": organization_id,
+                "organization_name": organization_name,
                 "enrolled_at": datetime.utcnow().isoformat() + 'Z',
                 "status": "Active"
             }
@@ -573,6 +662,9 @@ def register_face_routes(app, deps):
                     logger.warning(f"Skipping empty file at index {i}")
                     continue
 
+                if not (file.mimetype or "").startswith("image/"):
+                    return cleanup_and_rollback(f"File '{file.filename}' is not a valid image", 400)
+
                 filename = f"image_{i+1}.jpg"
                 filepath = os.path.join(images_folder, filename)
                 logger.info(f"Saving to: {filepath}")
@@ -580,16 +672,19 @@ def register_face_routes(app, deps):
                 try:
                     # Save image locally (handle webp and other formats)
                     image = Image.open(file.stream)
+                    image.verify()
+                    file.stream.seek(0)
+                    image = Image.open(file.stream)
                     # Convert RGBA to RGB if needed
                     if image.mode in ('RGBA', 'LA', 'P'):
+                        image = image.convert("RGB")
+                    else:
                         image = image.convert("RGB")
                     image.save(filepath, "JPEG", quality=85)
                     logger.info(f"✅ Image saved: {filename}")
                 except Exception as img_err:
                     logger.error(f"Failed to save image {filename}: {str(img_err)}")
-                    shutil.rmtree(resident_folder, ignore_errors=True)
-                    _delete_resident_supabase(cnic)
-                    return jsonify({"status": "error", "message": f"Failed to save image: {str(img_err)}"}), 500
+                    return cleanup_and_rollback(f"Failed to save image '{file.filename}': {str(img_err)}", 500)
 
                 # Calculate file hash
                 with open(filepath, 'rb') as f:
@@ -597,19 +692,62 @@ def register_face_routes(app, deps):
                 logger.info(f"File hash: {file_hash[:16]}...")
 
                 if file_hash in file_hashes:
-                    logger.error(f"Duplicate hash detected: {file_hash}")
-                    shutil.rmtree(resident_folder, ignore_errors=True)
-                    _delete_resident_supabase(cnic)
-                    return jsonify({"status": "error", "message": "Duplicate images detected"}), 400
+                    return cleanup_and_rollback("Duplicate images detected. Please upload unique photos only.", 400)
 
                 file_hashes.add(file_hash)
+
                 saved_files.append(filename)
+
+                # Validate that every image has exactly one face.
+                try:
+                    logger.info(f"Processing face detection for {filename}")
+                    faces = _detect_faces_insightface(filepath)
+                    face_count = len(faces) if faces else 0
+                    logger.info(f"Faces found: {face_count}")
+
+                    if face_count == 0:
+                        return cleanup_and_rollback(
+                            f"No face detected in '{file.filename}'. Upload a clear photo of a person.",
+                            400,
+                        )
+
+                    if face_count > 1:
+                        return cleanup_and_rollback(
+                            f"Multiple faces detected in '{file.filename}'. Each image must contain exactly one person.",
+                            400,
+                        )
+
+                    face = faces[0]
+                    embedding = face.get("embedding")
+                    if embedding is None:
+                        embedding = _get_embedding_insightface(face.get("crop"))
+
+                    normalized_embedding = _normalize_embedding_vector(embedding)
+                    if normalized_embedding is None:
+                        return cleanup_and_rollback(
+                            f"Could not extract a reliable face embedding from '{file.filename}'.",
+                            400,
+                        )
+
+                    encoding_result = _insert_resident_encoding_supabase(
+                        cnic=cnic,
+                        encoding_data=normalized_embedding,
+                        image_filename=filename
+                    )
+                    if encoding_result:
+                        saved_encodings.append(encoding_result)
+                        logger.info(f"✅ Saved encoding for {filename}")
+                    else:
+                        logger.warning(f"❌ Failed to save encoding for {filename}")
+                except Exception as enc_err:
+                    return cleanup_and_rollback(f"Face validation failed for '{file.filename}': {str(enc_err)}", 400)
 
                 # Upload to Supabase Storage
                 try:
                     storage_path = _resident_image_storage_path(cnic, filename)
                     logger.info(f"Uploading to storage: {storage_path}")
                     storage_result = _upload_local_file_to_supabase_storage(storage_path, filepath, content_type='image/jpeg')
+                    uploaded_storage_paths.append(storage_path)
                     
                     image_metadata = {
                         "filename": filename,
@@ -623,46 +761,16 @@ def register_face_routes(app, deps):
                     logger.info(f"✅ Uploaded {filename} to storage")
                 except Exception as storage_err:
                     logger.error(f"Failed to upload {filename} to storage: {str(storage_err)}")
-                    shutil.rmtree(resident_folder, ignore_errors=True)
-                    _delete_resident_supabase(cnic)
-                    return jsonify({"status": "error", "message": f"Failed to upload to storage: {str(storage_err)}"}), 500
-
-                # Generate and save face encoding
-                try:
-                    logger.info(f"Processing face detection for {filename}")
-                    faces = _detect_faces_insightface(filepath)
-                    logger.info(f"Faces found: {len(faces) if faces else 0}")
-                    
-                    if faces and len(faces) > 0:
-                        face = faces[0]
-                        embedding = face.get("embedding")
-                        
-                        if embedding is None:
-                            embedding = _get_embedding_insightface(face["crop"])
-                        
-                        if embedding is not None:
-                            encoding_result = _insert_resident_encoding_supabase(
-                                cnic=cnic,
-                                encoding_data=embedding,
-                                image_filename=filename
-                            )
-                            if encoding_result:
-                                saved_encodings.append(encoding_result)
-                                logger.info(f"✅ Saved encoding for {filename}")
-                            else:
-                                logger.warning(f"❌ Failed to save encoding for {filename}")
-                        else:
-                            logger.warning(f"❌ No embedding generated for {filename}")
-                    else:
-                        logger.warning(f"❌ No face detected in {filename}")
-                except Exception as enc_err:
-                    logger.error(f"Error processing encoding: {str(enc_err)}")
+                    return cleanup_and_rollback(f"Failed to upload image '{file.filename}' to storage: {str(storage_err)}", 500)
 
             if len(saved_files) == 0:
-                logger.error("No valid images were saved")
-                shutil.rmtree(resident_folder, ignore_errors=True)
-                _delete_resident_supabase(cnic)
-                return jsonify({"status": "error", "message": "No valid images uploaded"}), 400
+                return cleanup_and_rollback("No valid images uploaded", 400)
+
+            if len(saved_encodings) != len(saved_files):
+                return cleanup_and_rollback(
+                    "Could not generate face encodings for all images. Please re-upload clearer images.",
+                    400,
+                )
 
             # Insert image metadata
             if saved_images_metadata:
@@ -681,6 +789,8 @@ def register_face_routes(app, deps):
                 "phone": phone,
                 "address": address,
                 "city": city,
+                "organization_id": organization_id,
+                "organization_name": organization_name,
                 "enrolled_at": datetime.now().isoformat(),
                 "image_count": len(saved_files),
                 "faces_detected": len(saved_files),
@@ -717,21 +827,30 @@ def register_face_routes(app, deps):
                     if os.path.exists(resident_folder):
                         shutil.rmtree(resident_folder, ignore_errors=True)
                     _delete_resident_supabase(cnic)
-            except cleanup_err:
+            except Exception as cleanup_err:
                 logger.error(f"Cleanup error: {str(cleanup_err)}")
             return jsonify({"status": "error", "message": error_msg}), 500
     
     @app.route('/get-residents', methods=['GET'])
     def get_residents():
         try:
+            # Permission check: viewers cannot view the resident directory
+            is_allowed, error_info = _check_directory_permission()
+            if not is_allowed:
+                error_msg, status_code = error_info
+                return jsonify({"status": "error", "message": error_msg}), status_code
+
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+            
             residents = []
 
-            cloud_residents = _read_all_residents_supabase()
+            cloud_residents = _read_all_residents_supabase(company_id=company_id, company_name=company_name)
             if cloud_residents is not None:
                 for resident in cloud_residents:
                     cnic = resident.get('cnic')
                     images = []
-                    cloud_images = _read_resident_images_supabase(cnic)
+                    cloud_images = _read_resident_images_supabase(cnic, company_id=company_id, company_name=company_name)
                     if cloud_images:
                         images = [img.get('filename') for img in cloud_images if img.get('filename')]
 
@@ -764,6 +883,13 @@ def register_face_routes(app, deps):
                 with open(profile_path, 'r') as f:
                     pd = json.load(f)
 
+                resident_company_id = str(pd.get('organization_id') or '').strip()
+                resident_company_name = str(pd.get('organization_name') or '').strip()
+                if company_id and resident_company_id != company_id:
+                    continue
+                if company_name and resident_company_name != company_name:
+                    continue
+
                 images = []
                 if os.path.exists(images_folder):
                     images = [
@@ -795,7 +921,10 @@ def register_face_routes(app, deps):
     @app.route('/get-resident/<cnic>', methods=['GET'])
     def get_resident(cnic):
         try:
-            cloud_resident = _read_resident_supabase(cnic)
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+
+            cloud_resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
             if cloud_resident is not None:
                 pd = cloud_resident
             else:
@@ -805,9 +934,15 @@ def register_face_routes(app, deps):
                     return jsonify({"status": "error", "message": "Resident not found"}), 404
                 with open(profile_path, 'r') as f:
                     pd = json.load(f)
+                resident_company_id = str(pd.get('organization_id') or '').strip()
+                resident_company_name = str(pd.get('organization_name') or '').strip()
+                if company_id and resident_company_id != company_id:
+                    return jsonify({"status": "error", "message": "Resident not found"}), 404
+                if company_name and resident_company_name != company_name:
+                    return jsonify({"status": "error", "message": "Resident not found"}), 404
 
             images = []
-            cloud_images = _read_resident_images_supabase(cnic)
+            cloud_images = _read_resident_images_supabase(cnic, company_id=company_id, company_name=company_name)
             if cloud_images:
                 images = [img.get('filename') for img in cloud_images if img.get('filename')]
 
@@ -839,10 +974,26 @@ def register_face_routes(app, deps):
     @app.route('/get-resident-image/<cnic>/<filename>', methods=['GET'])
     def get_resident_image(cnic, filename):
         try:
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
             image_path = os.path.join(UPLOAD_FOLDER, cnic, 'images', filename)
+            resident_folder = os.path.join(UPLOAD_FOLDER, cnic)
+            profile_path = os.path.join(resident_folder, 'profile_data.json')
+            cloud_resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
+            if (company_id or company_name) and cloud_resident is None and not os.path.exists(profile_path):
+                return jsonify({"error": "Image not found"}), 404
+            if os.path.exists(profile_path):
+                with open(profile_path, 'r') as f:
+                    pd = json.load(f)
+                resident_company_id = str(pd.get('organization_id') or '').strip()
+                resident_company_name = str(pd.get('organization_name') or '').strip()
+                if company_id and resident_company_id != company_id:
+                    return jsonify({"error": "Image not found"}), 404
+                if company_name and resident_company_name != company_name:
+                    return jsonify({"error": "Image not found"}), 404
 
             if not os.path.exists(image_path):
-                cloud_images = _read_resident_images_supabase(cnic)
+                cloud_images = _read_resident_images_supabase(cnic, company_id=company_id, company_name=company_name)
                 storage_path = None
                 if cloud_images:
                     match = next((img for img in cloud_images if img.get('filename') == filename), None)
@@ -873,11 +1024,24 @@ def register_face_routes(app, deps):
     @app.route('/delete-resident/<cnic>', methods=['DELETE'])
     def delete_resident(cnic):
         try:
+            # Permission check: only owners/admins can delete
+            is_allowed, error_info = _check_delete_permission()
+            if not is_allowed:
+                error_msg, status_code = error_info
+                return jsonify({"status": "error", "message": error_msg}), status_code
+
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+
+            resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
+            if resident is None:
+                return jsonify({"status": "error", "message": "Resident not found"}), 404
+            
             resident_folder = os.path.join(UPLOAD_FOLDER, cnic)
             if not os.path.exists(resident_folder):
                 return jsonify({"status": "error", "message": "Resident not found"}), 404
 
-            cloud_images = _read_resident_images_supabase(cnic) or []
+            cloud_images = _read_resident_images_supabase(cnic, company_id=company_id, company_name=company_name) or []
             storage_paths = [img.get('storage_path') or _resident_image_storage_path(cnic, img.get('filename', '')) for img in cloud_images if img.get('filename')]
 
             shutil.rmtree(resident_folder)
@@ -893,7 +1057,12 @@ def register_face_routes(app, deps):
     @app.route('/update-resident-status/<cnic>', methods=['POST'])
     def update_resident_status(cnic):
         try:
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
             new_status = request.json.get('status')
+            resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
+            if resident is None:
+                return jsonify({"status": "error", "message": "Resident not found"}), 404
             profile_path = os.path.join(UPLOAD_FOLDER, cnic, 'profile_data.json')
             if not os.path.exists(profile_path):
                 return jsonify({"status": "error", "message": "Resident not found"}), 404
@@ -913,6 +1082,11 @@ def register_face_routes(app, deps):
     def update_resident(cnic):
         try:
             data = request.json
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+            resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
+            if resident is None:
+                return jsonify({"status": "error", "message": "Resident not found"}), 404
             profile_path = os.path.join(UPLOAD_FOLDER, cnic, 'profile_data.json')
             if not os.path.exists(profile_path):
                 return jsonify({"status": "error", "message": "Resident not found"}), 404

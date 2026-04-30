@@ -12,10 +12,28 @@ import {
   X,
 } from "lucide-react";
 import { Link } from "react-router";
+import { buildAuthHeaders } from "../../services/authSession";
+
+const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+]);
+
+const getFileSignature = (file: File) =>
+  `${file.name}::${file.size}::${file.lastModified}`;
+
+const bufferToHex = (buffer: ArrayBuffer) =>
+  Array.from(new Uint8Array(buffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
 function ResidentEnrollmentPage() {
   const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
+  const [previewUrls, setPreviewUrls] = useState<string[]>([]);
   const [modalData, setModalData] = useState({
     success: false,
     message: "",
@@ -42,22 +60,62 @@ function ResidentEnrollmentPage() {
   // Prevent body scroll when modal is open
   useEffect(() => {
     if (showModal) {
-      document.body.style.overflow = 'hidden';
+      document.body.style.overflow = "hidden";
     } else {
-      document.body.style.overflow = 'unset';
+      document.body.style.overflow = "unset";
     }
     return () => {
-      document.body.style.overflow = 'unset';
+      document.body.style.overflow = "unset";
     };
   }, [showModal]);
+
+  useEffect(() => {
+    const urls = formData.images.map((file) => URL.createObjectURL(file));
+    setPreviewUrls(urls);
+
+    return () => {
+      urls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [formData.images]);
+
+  const validateSelectedImages = async (images: File[]) => {
+    if (images.length < 3) {
+      return "Please upload at least 3 images.";
+    }
+
+    const uniqueByMeta = new Set(images.map(getFileSignature));
+    if (uniqueByMeta.size !== images.length) {
+      return "Duplicate images selected. Remove repeated files and try again.";
+    }
+
+    if (!window.crypto?.subtle) {
+      return null;
+    }
+
+    const hashes = await Promise.all(
+      images.map(async (file) => {
+        const buffer = await file.arrayBuffer();
+        const digest = await window.crypto.subtle.digest("SHA-256", buffer);
+        return bufferToHex(digest);
+      })
+    );
+
+    const uniqueHashes = new Set(hashes);
+    if (uniqueHashes.size !== hashes.length) {
+      return "Same image content was uploaded more than once. Please use different photos.";
+    }
+
+    return null;
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (formData.images.length < 3) {
+    const imageValidationError = await validateSelectedImages(formData.images);
+    if (imageValidationError) {
       setModalData({
         success: false,
-        message: "Please upload at least 3 images",
+        message: imageValidationError,
         name: "",
         cnic: "",
         email: "",
@@ -86,14 +144,9 @@ function ResidentEnrollmentPage() {
     try {
       const res = await fetch("http://127.0.0.1:5000/upload-images", {
         method: "POST",
+        headers: buildAuthHeaders(),
         body: data,
       });
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("Server error response:", errorText);
-        throw new Error(`Server responded with status ${res.status}`);
-      }
 
       let result;
       try {
@@ -101,59 +154,43 @@ function ResidentEnrollmentPage() {
         console.log("Server response:", result);
       } catch (parseError) {
         console.error("Failed to parse JSON response:", parseError);
-        if (res.status === 200) {
-          const tempImageUrls = formData.images.map((file) => URL.createObjectURL(file));
-          
-          setModalData({
-            success: true,
-            message: `${formData.name} enrolled successfully!`,
-            name: formData.name,
-            cnic: formData.cnic,
-            email: formData.email,
-            phone: formData.phone,
-            address: formData.address,
-            city: formData.city,
-            imagesCount: formData.images.length,
-            imageUrls: tempImageUrls,
-          });
-          setShowModal(true);
-          
-          setFormData({
-            cnic: "",
-            name: "",
-            email: "",
-            phone: "",
-            address: "",
-            city: "",
-            images: [],
-          });
-          setLoading(false);
-          return;
-        }
         throw new Error("Invalid response format from server");
       }
 
+      if (!res.ok) {
+        throw new Error(
+          result?.message ||
+            result?.error ||
+            `Server responded with status ${res.status}`
+        );
+      }
+
       if (res.status === 200) {
-        const isSuccess = result.status === "success" || 
-                         result.success === true || 
-                         result.message?.includes("successfully") ||
-                         (!result.error && result.data);
-        
+        const isSuccess =
+          result.status === "success" ||
+          result.success === true ||
+          result.data?.cnic;
+
         if (isSuccess) {
-          const imageUrls = result.image_urls || 
-                           result.data?.image_urls || 
-                           formData.images.map((file) => URL.createObjectURL(file));
-          
+          const imageUrls =
+            result.image_urls ||
+            result.data?.image_urls ||
+            formData.images.map((file) => URL.createObjectURL(file));
+
           setModalData({
             success: true,
-            message: result.message || `${formData.name} enrolled successfully!`,
+            message:
+              result.message || `${formData.name} enrolled successfully!`,
             name: formData.name,
             cnic: formData.cnic,
             email: formData.email,
             phone: formData.phone,
             address: formData.address,
             city: formData.city,
-            imagesCount: result.images_count || result.data?.images?.length || formData.images.length,
+            imagesCount:
+              result.images_count ||
+              result.data?.images?.length ||
+              formData.images.length,
             imageUrls: imageUrls,
           });
 
@@ -183,7 +220,8 @@ function ResidentEnrollmentPage() {
       } else {
         setModalData({
           success: false,
-          message: result?.message || result?.error || "Failed to enroll resident",
+          message:
+            result?.message || result?.error || "Failed to enroll resident",
           name: "",
           cnic: "",
           email: "",
@@ -197,47 +235,84 @@ function ResidentEnrollmentPage() {
       setShowModal(true);
     } catch (err) {
       console.error("Enrollment error:", err);
-      const tempImageUrls = formData.images.map((file) => URL.createObjectURL(file));
-      
+
       setModalData({
-        success: true,
-        message: `${formData.name} has been enrolled successfully!`,
-        name: formData.name,
-        cnic: formData.cnic,
-        email: formData.email,
-        phone: formData.phone,
-        address: formData.address,
-        city: formData.city,
-        imagesCount: formData.images.length,
-        imageUrls: tempImageUrls,
-      });
-      setShowModal(true);
-      
-      setFormData({
-        cnic: "",
+        success: false,
+        message:
+          err instanceof Error
+            ? err.message
+            : "Enrollment failed. Ensure each image contains exactly one face of the same person and no duplicates.",
         name: "",
+        cnic: "",
         email: "",
         phone: "",
         address: "",
         city: "",
-        images: [],
+        imagesCount: 0,
+        imageUrls: [],
       });
+      setShowModal(true);
     } finally {
       setLoading(false);
     }
   };
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      const filesArray = Array.from(e.target.files);
-      setFormData({ ...formData, images: [...formData.images, ...filesArray] });
+    if (!e.target.files) {
+      return;
     }
+
+    const filesArray = Array.from(e.target.files);
+    const existingSignatures = new Set(formData.images.map(getFileSignature));
+    const nextImages = [...formData.images];
+    const rejected: string[] = [];
+
+    filesArray.forEach((file) => {
+      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+        rejected.push(`${file.name}: unsupported format`);
+        return;
+      }
+
+      if (file.size > MAX_IMAGE_SIZE_BYTES) {
+        rejected.push(`${file.name}: exceeds 5MB`);
+        return;
+      }
+
+      const signature = getFileSignature(file);
+      if (existingSignatures.has(signature)) {
+        rejected.push(`${file.name}: duplicate file selected`);
+        return;
+      }
+
+      existingSignatures.add(signature);
+      nextImages.push(file);
+    });
+
+    setFormData({ ...formData, images: nextImages });
+
+    if (rejected.length > 0) {
+      setModalData({
+        success: false,
+        message: `Some files were skipped:\n${rejected.join("\n")}`,
+        name: "",
+        cnic: "",
+        email: "",
+        phone: "",
+        address: "",
+        city: "",
+        imagesCount: 0,
+        imageUrls: [],
+      });
+      setShowModal(true);
+    }
+
+    e.target.value = "";
   };
 
   const closeModal = () => {
     // Clean up object URLs to prevent memory leaks
-    modalData.imageUrls.forEach(url => {
-      if (url.startsWith('blob:')) {
+    modalData.imageUrls.forEach((url) => {
+      if (url.startsWith("blob:")) {
         URL.revokeObjectURL(url);
       }
     });
@@ -432,7 +507,7 @@ function ResidentEnrollmentPage() {
                 {formData.images.map((file, index) => (
                   <div key={index} className="relative group">
                     <img
-                      src={URL.createObjectURL(file)}
+                      src={previewUrls[index]}
                       alt={`Upload ${index + 1}`}
                       className="w-full h-24 object-cover rounded-lg border border-slate-200"
                     />
@@ -472,7 +547,7 @@ function ResidentEnrollmentPage() {
                 ${
                   loading
                     ? "bg-gray-400 cursor-not-allowed"
-                    : "bg-gradient-to-r from-blue-500 to-cyan-500 hover:scale-105 hover:shadow-xl cursor-pointer"
+                    : "bg-linear-to-r from-blue-500 to-cyan-500 hover:scale-105 hover:shadow-xl cursor-pointer"
                 }
               `}
             >
@@ -496,11 +571,11 @@ function ResidentEnrollmentPage() {
       {showModal && (
         <div className="fixed inset-0 z-50">
           {/* Backdrop with blur - prevents interaction with background */}
-          <div 
+          <div
             className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-all duration-300"
             onClick={closeModal}
           />
-          
+
           {/* Modal Container */}
           <div className="relative flex items-center justify-center min-h-screen p-4">
             <div className="bg-white rounded-xl max-w-2xl w-full shadow-2xl animate-in fade-in zoom-in duration-300 max-h-[90vh] overflow-y-auto">
@@ -518,7 +593,7 @@ function ResidentEnrollmentPage() {
                   </div>
                   <button
                     onClick={closeModal}
-                    className="text-slate-400 hover:text-slate-600 transition-colors cursor-pointer hover:scale-110 transform transition-transform"
+                    className="text-slate-400 hover:text-slate-600 transition-all cursor-pointer hover:scale-110"
                     aria-label="Close modal"
                   >
                     <X className="w-6 h-6" />
@@ -527,50 +602,67 @@ function ResidentEnrollmentPage() {
 
                 <div className="space-y-4">
                   <p className="text-slate-700 text-lg">{modalData.message}</p>
-                  
+
                   {modalData.success && modalData.imagesCount > 0 && (
                     <>
                       {/* Success Badge */}
-                      <div className="mt-4 p-4 bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg border border-green-200">
+                      <div className="mt-4 p-4 bg-linear-to-r from-green-50 to-emerald-50 rounded-lg border border-green-200">
                         <div className="flex items-center gap-2">
                           <CheckCircle className="w-5 h-5 text-green-600" />
                           <p className="text-sm text-green-800 font-medium">
-                            ✓ {modalData.imagesCount} image(s) saved successfully
+                            ✓ {modalData.imagesCount} image(s) saved
+                            successfully
                           </p>
                         </div>
                       </div>
 
                       {/* Resident Information Summary */}
-                      <div className="mt-4 p-4 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
+                      <div className="mt-4 p-4 bg-linear-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
                         <h4 className="text-sm font-semibold text-blue-800 mb-3 flex items-center gap-2">
                           <User className="w-4 h-4" />
                           Resident Information:
                         </h4>
                         <div className="space-y-2 text-sm">
                           <div className="grid grid-cols-2 gap-2">
-                            <p className="text-blue-700"><strong>Name:</strong></p>
+                            <p className="text-blue-700">
+                              <strong>Name:</strong>
+                            </p>
                             <p className="text-blue-900">{modalData.name}</p>
-                            
-                            <p className="text-blue-700"><strong>CNIC:</strong></p>
+
+                            <p className="text-blue-700">
+                              <strong>CNIC:</strong>
+                            </p>
                             <p className="text-blue-900">{modalData.cnic}</p>
-                            
-                            <p className="text-blue-700"><strong>Email:</strong></p>
+
+                            <p className="text-blue-700">
+                              <strong>Email:</strong>
+                            </p>
                             <p className="text-blue-900">{modalData.email}</p>
-                            
-                            <p className="text-blue-700"><strong>Phone:</strong></p>
+
+                            <p className="text-blue-700">
+                              <strong>Phone:</strong>
+                            </p>
                             <p className="text-blue-900">{modalData.phone}</p>
-                            
+
                             {modalData.address && (
                               <>
-                                <p className="text-blue-700"><strong>Address:</strong></p>
-                                <p className="text-blue-900">{modalData.address}</p>
+                                <p className="text-blue-700">
+                                  <strong>Address:</strong>
+                                </p>
+                                <p className="text-blue-900">
+                                  {modalData.address}
+                                </p>
                               </>
                             )}
-                            
+
                             {modalData.city && (
                               <>
-                                <p className="text-blue-700"><strong>City:</strong></p>
-                                <p className="text-blue-900">{modalData.city}</p>
+                                <p className="text-blue-700">
+                                  <strong>City:</strong>
+                                </p>
+                                <p className="text-blue-900">
+                                  {modalData.city}
+                                </p>
                               </>
                             )}
                           </div>
@@ -586,13 +678,16 @@ function ResidentEnrollmentPage() {
                           </h4>
                           <div className="grid grid-cols-3 gap-3">
                             {modalData.imageUrls.map((url, index) => (
-                              <div key={index} className="relative group overflow-hidden rounded-lg">
+                              <div
+                                key={index}
+                                className="relative group overflow-hidden rounded-lg"
+                              >
                                 <img
                                   src={url}
                                   alt={`Resident ${index + 1}`}
                                   className="w-full h-32 object-cover rounded-lg border border-slate-200 shadow-sm hover:scale-105 transition-transform duration-300"
                                 />
-                                <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+                                <div className="absolute inset-0 bg-linear-to-t from-black/50 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
                                 <span className="absolute bottom-2 left-2 bg-black/70 text-white text-xs px-2 py-1 rounded-md backdrop-blur-sm">
                                   Image {index + 1}
                                 </span>
@@ -605,11 +700,12 @@ function ResidentEnrollmentPage() {
                   )}
 
                   {!modalData.success && (
-                    <div className="mt-4 p-4 bg-gradient-to-r from-red-50 to-rose-50 rounded-lg border border-red-200">
+                    <div className="mt-4 p-4 bg-linear-to-r from-red-50 to-rose-50 rounded-lg border border-red-200">
                       <div className="flex items-center gap-2">
                         <X className="w-5 h-5 text-red-600" />
                         <p className="text-sm text-red-800">
-                          Please check the information and try again. Make sure all required fields are filled correctly.
+                          Please check the information and try again. Make sure
+                          all required fields are filled correctly.
                         </p>
                       </div>
                     </div>
@@ -619,7 +715,7 @@ function ResidentEnrollmentPage() {
                 <div className="mt-6 flex justify-end">
                   <button
                     onClick={closeModal}
-                    className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all duration-200 cursor-pointer shadow-md hover:shadow-lg transform hover:scale-105"
+                    className="px-6 py-2.5 bg-linear-to-r from-blue-500 to-blue-600 text-white rounded-lg hover:from-blue-600 hover:to-blue-700 transition-all duration-200 cursor-pointer shadow-md hover:shadow-lg hover:scale-105"
                   >
                     Close
                   </button>

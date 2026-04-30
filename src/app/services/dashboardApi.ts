@@ -1,3 +1,5 @@
+import { buildAuthHeaders } from "./authSession";
+
 const API_BASE = "http://127.0.0.1:5000";
 
 export interface DashboardActivity {
@@ -22,7 +24,9 @@ export interface DashboardOverview {
 }
 
 export async function fetchDashboardOverview(): Promise<DashboardOverview> {
-  const res = await fetch(`${API_BASE}/dashboard-overview`);
+  const res = await fetch(`${API_BASE}/dashboard-overview`, {
+    headers: buildAuthHeaders(),
+  });
   const result = await res.json();
 
   if (result.status !== "success") {

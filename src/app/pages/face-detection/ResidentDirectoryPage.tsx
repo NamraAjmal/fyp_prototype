@@ -19,6 +19,9 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { Link } from "react-router";
+import { getAuthSession } from "../../services/authSession";
+import { buildAuthHeaders } from "../../services/authSession";
+import { hasPremiumAccess } from "../../services/billingApi";
 
 const API_BASE = "http://127.0.0.1:5000";
 
@@ -88,6 +91,7 @@ const EXPORT_OPTIONS = [
 
 function ExportDropdown({ residents }: { residents: Resident[] }) {
   const [open, setOpen] = useState(false);
+  const canExport = hasPremiumAccess();
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -101,6 +105,9 @@ function ExportDropdown({ residents }: { residents: Resident[] }) {
 
   const doExport = (id: string) => {
     setOpen(false);
+    if (!canExport) {
+      return;
+    }
     const headers = [
       "CNIC",
       "Name",
@@ -182,8 +189,10 @@ function ExportDropdown({ residents }: { residents: Resident[] }) {
   return (
     <div ref={ref} className="relative">
       <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-2 px-4 py-3 border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer select-none text-slate-700"
+        onClick={() => canExport && setOpen((v) => !v)}
+        disabled={!canExport}
+        title={canExport ? "Export" : "Upgrade required to export reports"}
+        className="flex items-center gap-2 px-4 py-3 border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer select-none text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
       >
         <Download className="w-4 h-4" />
         Export
@@ -580,6 +589,9 @@ function ViewModal({
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 function ResidentDirectoryPage() {
+  const session = getAuthSession();
+  const role = (session?.role || "").toLowerCase();
+  const canDeleteResidents = role === "owner" || role === "admin";
   const [residents, setResidents] = useState<Resident[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -594,7 +606,9 @@ function ResidentDirectoryPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/get-residents`);
+      const res = await fetch(`${API_BASE}/get-residents`, {
+        headers: buildAuthHeaders(),
+      });
       const result = await res.json();
 
       if (result.status !== "success") {
@@ -610,7 +624,8 @@ function ResidentDirectoryPage() {
 
           try {
             const detailRes = await fetch(
-              `${API_BASE}/get-resident/${resident.cnic}`
+              `${API_BASE}/get-resident/${resident.cnic}`,
+              { headers: buildAuthHeaders() }
             );
             const detailResult = await detailRes.json();
             if (
@@ -655,7 +670,7 @@ function ResidentDirectoryPage() {
     try {
       const res = await fetch(
         `${API_BASE}/delete-resident/${deleteTarget.cnic}`,
-        { method: "DELETE" }
+        { method: "DELETE", headers: buildAuthHeaders() }
       );
       const result = await res.json();
       if (result.status === "success") {
@@ -664,10 +679,10 @@ function ResidentDirectoryPage() {
         );
         setDeleteTarget(null);
       } else {
-        alert("Error: " + result.message);
+        setError(result.message || "Failed to delete resident.");
       }
     } catch {
-      alert("Failed to delete resident.");
+      setError("Failed to delete resident.");
     } finally {
       setDeleting(false);
     }
@@ -681,7 +696,10 @@ function ResidentDirectoryPage() {
         `${API_BASE}/update-resident-status/${resident.cnic}`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...buildAuthHeaders(),
+          },
           body: JSON.stringify({ status: newStatus }),
         }
       );
@@ -692,9 +710,11 @@ function ResidentDirectoryPage() {
             row.cnic === resident.cnic ? { ...row, status: newStatus } : row
           )
         );
+      } else {
+        setError(result.message || "Failed to update status.");
       }
     } catch {
-      alert("Failed to update status.");
+      setError("Failed to update status.");
     }
   };
 
@@ -866,13 +886,15 @@ function ResidentDirectoryPage() {
                           >
                             <Edit className="w-4 h-4" />
                           </button>
-                          <button
-                            onClick={() => setDeleteTarget(resident)}
-                            className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          {canDeleteResidents && (
+                            <button
+                              onClick={() => setDeleteTarget(resident)}
+                              className="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                              title="Delete"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>

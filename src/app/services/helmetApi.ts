@@ -1,3 +1,5 @@
+import { buildAuthHeaders } from "./authSession";
+
 export type HelmetLog = {
   id: number;
   timestamp: string;
@@ -99,6 +101,7 @@ export async function detectHelmet(params: {
 
   const response = await fetch(buildUrl("/helmet-detect"), {
     method: "POST",
+    headers: buildAuthHeaders(),
     body: formData,
   });
 
@@ -125,7 +128,10 @@ export async function fetchHelmetLogs(params?: {
       min_confidence: params?.minConfidence,
       start_time: params?.startTime,
       end_time: params?.endTime,
-    })
+    }),
+    {
+      headers: buildAuthHeaders(),
+    }
   );
 
   return parseApiResponse<HelmetLogsResponse>(response);

@@ -5,8 +5,12 @@ import {
   fetchHelmetSummary,
   type HelmetSummary,
 } from "../../services/helmetApi";
+import { getAuthSession } from "../../services/authSession";
 
 function HelmetDetectionPage() {
+  const session = getAuthSession();
+  const role = (session?.role || "").toLowerCase();
+  const isViewer = role === "viewer";
   const [summary, setSummary] = useState<HelmetSummary>({
     total_detections: 0,
     compliant: 0,
@@ -44,7 +48,7 @@ function HelmetDetectionPage() {
       path: "/dashboard/helmet-detection/logs",
       color: "from-purple-500 to-pink-500",
     },
-  ];
+  ].filter((feature) => !isViewer || feature.title === "Logs & Analytics");
 
   return (
     <div className="space-y-8">

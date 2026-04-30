@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import {
   ArrowLeft,
   Camera,
@@ -16,6 +16,14 @@ import {
   fetchHelmetLogs,
   type HelmetLog,
 } from "../../services/helmetApi";
+import { getAuthSession } from "../../services/authSession";
+
+type BoundingBox = {
+  bbox: [number, number, number, number];
+  label: string;
+  confidence: number;
+  type: string;
+};
 
 type DetectionResult = {
   id: number;
@@ -58,9 +66,76 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
     </div>
   );
 }
+function drawBoxes(
+  canvas: HTMLCanvasElement,
+  video: HTMLVideoElement,
+  boxes: BoundingBox[],
+  videoNaturalW: number,
+  videoNaturalH: number
+) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  canvas.width = video.clientWidth;
+  canvas.height = video.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!boxes.length || !videoNaturalW || !videoNaturalH) return;
+
+  const scaleX = canvas.width / videoNaturalW;
+  const scaleY = canvas.height / videoNaturalH;
+
+  for (const det of boxes) {
+    const [x1, y1, x2, y2] = det.bbox;
+    const sx1 = x1 * scaleX;
+    const sy1 = y1 * scaleY;
+    const sw = (x2 - x1) * scaleX;
+    const sh = (y2 - y1) * scaleY;
+
+    // Determine if helmet based on type or label
+    let isHelmet = false;
+    if (det.type === "with_helmet") {
+      isHelmet = true;
+    } else if (det.type === "without_helmet") {
+      isHelmet = false;
+    } else {
+      const labelLower = det.label.toLowerCase();
+      isHelmet =
+        labelLower.includes("helmet") ||
+        labelLower.includes("hardhat") ||
+        labelLower.includes("hard hat");
+    }
+
+    const color = isHelmet ? "#22c55e" : "#ef4444";
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(sx1, sy1, sw, sh);
+
+    // FIX: Convert confidence from 0-1 to 0-100 for display
+    // Backend returns confidence as 0-1 (e.g., 0.85 for 85%)
+    const confidencePercent = Math.round(det.confidence * 100);
+
+    const displayLabel = isHelmet ? "Helmet" : "No Helmet";
+    const label = `${displayLabel} ${confidencePercent}%`;
+
+    ctx.font = "bold 13px sans-serif";
+    const textW = ctx.measureText(label).width;
+    const textH = 18;
+    const labelY = sy1 > textH + 4 ? sy1 - 4 : sy1 + sh + textH + 4;
+
+    ctx.fillStyle = color;
+    ctx.fillRect(sx1, labelY - textH, textW + 8, textH + 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(label, sx1 + 4, labelY - 3);
+  }
+}
 
 function HelmetImageCapturePage() {
-  const STORAGE_KEY = "helmetDetection.captureResults.v1";
+  const session = getAuthSession();
+  const STORAGE_KEY = `helmetDetection.captureResults.v1.${
+    session?.organizationId || "global"
+  }`;
   const [captureMode, setCaptureMode] = useState<"upload" | "camera">("upload");
   const [isRecording, setIsRecording] = useState(false);
   const [isDetecting, setIsDetecting] = useState(false);
@@ -70,7 +145,22 @@ function HelmetImageCapturePage() {
     []
   );
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [liveStatus, setLiveStatus] = useState<{
+    status: string;
+    persons: number;
+    helmets: number;
+    no_helmet: number;
+    confidence: number;
+  } | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rafRef = useRef<number | null>(null);
+  // Detection loop state — use refs so the rAF loop sees latest values
+  const isDetectingRef = useRef(false); // is an API call in-flight?
+  const isRunningRef = useRef(false); // should the loop keep going?
+  const currentBoxesRef = useRef<BoundingBox[]>([]);
+  const videoNaturalSize = useRef({ w: 0, h: 0 });
 
   const toDetectionResult = (log: HelmetLog): DetectionResult => ({
     id: Number(log.id),
@@ -88,36 +178,27 @@ function HelmetImageCapturePage() {
 
   useEffect(() => {
     let isMounted = true;
-
     const hydrateResults = async () => {
       try {
         const payload = await fetchHelmetLogs({ page: 1, pageSize: 30 });
-        if (!isMounted) {
-          return;
-        }
+        if (!isMounted) return;
         const fromApi = (payload.logs || []).map(toDetectionResult);
         if (fromApi.length > 0) {
           setDetectionResults(fromApi);
           return;
         }
       } catch {
-        // Fallback to browser cache when backend is unavailable.
+        /* fallback */
       }
-
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw || !isMounted) {
-          return;
-        }
+        if (!raw || !isMounted) return;
         const parsed = JSON.parse(raw) as DetectionResult[];
-        if (Array.isArray(parsed)) {
-          setDetectionResults(parsed);
-        }
+        if (Array.isArray(parsed)) setDetectionResults(parsed);
       } catch {
-        // Ignore malformed local cache.
+        /* ignore */
       }
     };
-
     hydrateResults();
     return () => {
       isMounted = false;
@@ -131,19 +212,172 @@ function HelmetImageCapturePage() {
         JSON.stringify(detectionResults.slice(0, 100))
       );
     } catch {
-      // Ignore storage quota or serialization errors.
+      /* ignore */
     }
   }, [detectionResults]);
+
+  // ── rAF loop: draws boxes every frame, fires API call when previous one done ──
+  // ── rAF loop: draws boxes every frame, fires API call when previous one done ──
+  const renderLoop = useCallback(() => {
+    if (!isRunningRef.current) return;
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    if (video && canvas && video.readyState >= 2) {
+      drawBoxes(
+        canvas,
+        video,
+        currentBoxesRef.current,
+        videoNaturalSize.current.w,
+        videoNaturalSize.current.h
+      );
+
+      // Fire a new detection only when the previous API call has finished
+      if (!isDetectingRef.current) {
+        isDetectingRef.current = true;
+
+        // Capture frame at reduced resolution for speed (640px wide)
+        const offscreen = document.createElement("canvas");
+        const scale = Math.min(1, 640 / video.videoWidth);
+        offscreen.width = Math.round(video.videoWidth * scale);
+        offscreen.height = Math.round(video.videoHeight * scale);
+        const octx = offscreen.getContext("2d");
+        if (octx) {
+          octx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+          offscreen.toBlob(
+            (blob) => {
+              if (!blob || !isRunningRef.current) {
+                isDetectingRef.current = false;
+                return;
+              }
+              const file = new File([blob], "stream-frame.jpg", {
+                type: "image/jpeg",
+              });
+              detectHelmet({ file, source: "camera" })
+                .then((payload) => {
+                  if (!isRunningRef.current) return;
+                  const d = payload.data;
+
+                  // DEBUG: Log confidence values
+                  if (d.detections && d.detections.length > 0) {
+                    console.log("Sample detection:", {
+                      label: d.detections[0].label,
+                      confidence_raw: d.detections[0].confidence,
+                      confidence_percent: Math.round(
+                        d.detections[0].confidence * 100
+                      ),
+                    });
+                  }
+
+                  // Process detections
+                  const processedDetections = (d.detections ?? []).map(
+                    (det) => ({
+                      bbox: det.bbox as [number, number, number, number],
+                      label: det.label,
+                      confidence: Number(det.confidence), // Keep as 0-1
+                      type:
+                        det.type ||
+                        (det.label?.toLowerCase().includes("helmet")
+                          ? "with_helmet"
+                          : "without_helmet"),
+                    })
+                  );
+
+                  currentBoxesRef.current = processedDetections.filter(
+                    (det): det is BoundingBox =>
+                      Array.isArray(det.bbox) && det.bbox.length === 4
+                  );
+
+                  videoNaturalSize.current = {
+                    w: offscreen.width,
+                    h: offscreen.height,
+                  };
+                  setLiveStatus({
+                    status: d.status,
+                    persons: d.persons,
+                    helmets: d.helmets,
+                    no_helmet: d.no_helmet ?? 0,
+                    confidence: Number(d.confidence ?? 0),
+                  });
+                })
+                .catch((err) => {
+                  console.error("Detection error:", err);
+                })
+                .finally(() => {
+                  isDetectingRef.current = false;
+                });
+            },
+            "image/jpeg",
+            0.75
+          );
+        } else {
+          isDetectingRef.current = false;
+        }
+      }
+    }
+
+    rafRef.current = requestAnimationFrame(renderLoop);
+  }, []);
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "environment",
+        },
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.onloadedmetadata = () => {
+          videoNaturalSize.current = {
+            w: videoRef.current!.videoWidth,
+            h: videoRef.current!.videoHeight,
+          };
+        };
+      }
+      isRunningRef.current = true;
+      isDetectingRef.current = false;
+      currentBoxesRef.current = [];
+      rafRef.current = requestAnimationFrame(renderLoop);
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Camera error:", err);
+      setErrorMessage("Could not access camera. Please check permissions.");
+    }
+  };
+
+  const stopCamera = () => {
+    isRunningRef.current = false;
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    if (videoRef.current?.srcObject) {
+      (videoRef.current.srcObject as MediaStream)
+        .getTracks()
+        .forEach((t) => t.stop());
+      videoRef.current.srcObject = null;
+    }
+    // Clear canvas
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext("2d");
+      ctx?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+    }
+    currentBoxesRef.current = [];
+    setIsRecording(false);
+    setLiveStatus(null);
+  };
+
+  // Cleanup on unmount
+  useEffect(() => () => stopCamera(), []);
 
   const detectSingleImage = async (
     file: File,
     source: "image" | "camera"
   ): Promise<DetectionResult> => {
-    const payload = await detectHelmet({
-      file,
-      source,
-    });
-
+    const payload = await detectHelmet({ file, source });
     const data = payload.data;
     return {
       id: data.id,
@@ -161,40 +395,28 @@ function HelmetImageCapturePage() {
   };
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files || e.target.files.length === 0) {
-      return;
-    }
-
+    if (!e.target.files || e.target.files.length === 0) return;
     const filesArray = Array.from(e.target.files);
     setUploadedImages((prev) => [...prev, ...filesArray]);
     setErrorMessage("");
     setIsDetecting(true);
-
     try {
       const settledResults = await Promise.allSettled(
         filesArray.map((file) => detectSingleImage(file, "image"))
       );
-
       const successResults = settledResults
         .filter(
-          (result): result is PromiseFulfilledResult<DetectionResult> =>
-            result.status === "fulfilled"
+          (r): r is PromiseFulfilledResult<DetectionResult> =>
+            r.status === "fulfilled"
         )
-        .map((result) => result.value);
-
+        .map((r) => r.value);
       const failedCount = settledResults.filter(
-        (result) => result.status === "rejected"
+        (r) => r.status === "rejected"
       ).length;
-
-      if (failedCount > 0) {
-        setErrorMessage(
-          `${failedCount} image(s) could not be processed. Check backend logs/model path.`
-        );
-      }
-
-      if (successResults.length > 0) {
+      if (failedCount > 0)
+        setErrorMessage(`${failedCount} image(s) could not be processed.`);
+      if (successResults.length > 0)
         setDetectionResults((prev) => [...successResults, ...prev]);
-      }
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : "Error during helmet detection"
@@ -205,82 +427,12 @@ function HelmetImageCapturePage() {
     }
   };
 
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
-    } catch (err) {
-      console.error("Error accessing camera:", err);
-      alert("Could not access camera. Please check permissions.");
-    }
-  };
-
-  const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
-      videoRef.current.srcObject = null;
-    }
-  };
-
-  const toggleRecording = () => {
-    if (!isRecording) {
-      startCamera();
-    } else {
-      stopCamera();
-    }
-    setIsRecording(!isRecording);
-  };
-
-  const captureFrame = async () => {
-    if (!videoRef.current) {
-      return;
-    }
-
-    const video = videoRef.current;
-    if (!video.videoWidth || !video.videoHeight) {
-      setErrorMessage("Camera is not ready yet. Please try again.");
-      return;
-    }
-
-    setIsDetecting(true);
-    setErrorMessage("");
-
-    try {
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-
-      const context = canvas.getContext("2d");
-      if (!context) {
-        throw new Error("Unable to capture camera frame");
-      }
-
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      const blob = await new Promise<Blob | null>((resolve) => {
-        canvas.toBlob(resolve, "image/jpeg", 0.92);
-      });
-
-      if (!blob) {
-        throw new Error("Failed to create image from camera frame");
-      }
-
-      const fileName = `camera-capture-${Date.now()}.jpg`;
-      const imageFile = new File([blob], fileName, { type: "image/jpeg" });
-      const result = await detectSingleImage(imageFile, "camera");
-
-      setDetectionResults((prev) => [result, ...prev]);
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Frame detection failed"
-      );
-    } finally {
-      setIsDetecting(false);
-    }
-  };
+  const statusColor =
+    liveStatus?.status === "Compliant"
+      ? "bg-green-500"
+      : liveStatus?.status === "Violation"
+      ? "bg-red-500"
+      : "bg-slate-500";
 
   return (
     <>
@@ -309,7 +461,10 @@ function HelmetImageCapturePage() {
         <div className="bg-white rounded-xl p-6 shadow-md border border-slate-200/50">
           <div className="flex gap-4 mb-6">
             <button
-              onClick={() => setCaptureMode("upload")}
+              onClick={() => {
+                if (isRecording) stopCamera();
+                setCaptureMode("upload");
+              }}
               className={`flex-1 py-3 px-6 rounded-lg font-medium transition-all ${
                 captureMode === "upload"
                   ? "bg-linear-to-r from-orange-500 to-red-500 text-white shadow-lg"
@@ -356,7 +511,6 @@ function HelmetImageCapturePage() {
                   </p>
                 </label>
               </div>
-
               {uploadedImages.length > 0 && (
                 <div className="mt-6">
                   <p className="text-sm font-medium text-slate-700 mb-3">
@@ -383,24 +537,55 @@ function HelmetImageCapturePage() {
 
           {captureMode === "camera" && (
             <div>
+              {/* Video + canvas overlay stacked */}
               <div className="relative bg-slate-900 rounded-lg overflow-hidden aspect-video">
                 <video
                   ref={videoRef}
                   autoPlay
                   playsInline
+                  muted
                   className="w-full h-full object-cover"
                 />
+                {/* Canvas sits on top of video, pointer-events:none so video controls work */}
+                <canvas
+                  ref={canvasRef}
+                  className="absolute inset-0 w-full h-full"
+                  style={{ pointerEvents: "none" }}
+                />
                 {!isRecording && (
-                  <div className="absolute inset-0 flex items-center justify-center bg-slate-900/50">
+                  <div className="absolute inset-0 flex items-center justify-center bg-slate-900/60">
                     <p className="text-white text-lg">Camera not active</p>
+                  </div>
+                )}
+                {/* Live status badge */}
+                {isRecording && liveStatus && (
+                  <div className="absolute top-3 left-3 flex items-center gap-2">
+                    <span
+                      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-semibold text-white ${statusColor}`}
+                    >
+                      <span className="w-2 h-2 rounded-full bg-white/80 animate-pulse" />
+                      {liveStatus.status}
+                    </span>
+                    <span className="bg-black/60 text-white text-xs px-2 py-1 rounded-full">
+                      {liveStatus.persons}P · {liveStatus.helmets}✓ ·{" "}
+                      {liveStatus.no_helmet}✗ ·{" "}
+                      {liveStatus.confidence.toFixed(0)}%
+                    </span>
+                  </div>
+                )}
+                {/* Scanning indicator when no result yet */}
+                {isRecording && !liveStatus && (
+                  <div className="absolute top-3 left-3 flex items-center gap-2 bg-black/60 text-white text-sm px-3 py-1 rounded-full">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Scanning...
                   </div>
                 )}
               </div>
 
-              <div className="mt-6 flex justify-center gap-4">
+              <div className="mt-6 flex justify-center">
                 <button
-                  onClick={toggleRecording}
-                  className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium shadow-lg transition-all ${
+                  onClick={isRecording ? stopCamera : startCamera}
+                  className={`flex items-center gap-2 px-8 py-3 rounded-lg font-medium shadow-lg transition-all ${
                     isRecording
                       ? "bg-red-500 hover:bg-red-600 text-white"
                       : "bg-linear-to-r from-orange-500 to-red-500 hover:shadow-xl text-white"
@@ -418,21 +603,6 @@ function HelmetImageCapturePage() {
                     </>
                   )}
                 </button>
-
-                {isRecording && (
-                  <button
-                    onClick={captureFrame}
-                    disabled={isDetecting}
-                    className="flex items-center gap-2 px-6 py-3 bg-green-500 hover:bg-green-600 disabled:bg-green-300 text-white rounded-lg font-medium shadow-lg transition-all"
-                  >
-                    {isDetecting ? (
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                    ) : (
-                      <Camera className="w-5 h-5" />
-                    )}
-                    Capture Frame
-                  </button>
-                )}
               </div>
             </div>
           )}
@@ -443,7 +613,6 @@ function HelmetImageCapturePage() {
               Running helmet detection...
             </p>
           )}
-
           {errorMessage && (
             <p className="mt-4 text-sm text-red-600">{errorMessage}</p>
           )}
@@ -474,7 +643,6 @@ function HelmetImageCapturePage() {
                 </button>
               </div>
             </div>
-
             <div className="space-y-3">
               {detectionResults.map((result) => (
                 <div
@@ -500,20 +668,19 @@ function HelmetImageCapturePage() {
                       <Camera className="w-5 h-5 text-slate-400" />
                     </div>
                   )}
-
                   <div className="flex-1">
                     <p className="font-medium text-slate-800">
                       {result.fileName}
                     </p>
                     <p className="text-sm text-slate-600">
-                      {result.personsDetected} person(s) •{" "}
-                      {result.helmetsDetected} helmet(s) • Confidence:{" "}
+                      {result.personsDetected} person(s) ·{" "}
+                      {result.helmetsDetected} helmet(s) · Confidence:{" "}
                       {result.confidence.toFixed(1)}%
                     </p>
                     <p className="text-xs text-slate-500 mt-1">
-                      {result.source} • {result.timestamp}
+                      {result.source} · {result.timestamp}
                       {result.processingMs > 0
-                        ? ` • ${result.processingMs.toFixed(0)} ms`
+                        ? ` · ${result.processingMs.toFixed(0)} ms`
                         : ""}
                     </p>
                   </div>

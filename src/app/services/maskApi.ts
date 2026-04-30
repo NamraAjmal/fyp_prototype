@@ -1,3 +1,5 @@
+import { buildAuthHeaders } from "./authSession";
+
 // // services/maskApi.ts - add these new functions
 
 // const API_BASE = "http://localhost:5000";
@@ -248,6 +250,7 @@ export async function detectMaskImage(
 
   const res = await fetch(`${API_BASE}/mask-detect`, {
     method: "POST",
+    headers: buildAuthHeaders(),
     body: formData,
   });
   if (!res.ok) throw new Error(`Detection failed: ${res.statusText}`);
@@ -271,7 +274,10 @@ export async function detectMaskStream(
   const res = await fetch(`${API_BASE}/mask-detect`, {
     // FIXED: Using /mask-detect instead of /mask-detect-stream
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAuthHeaders(),
+    },
     body: JSON.stringify({
       frame: frameBase64,
       camera_id: cameraId,
@@ -310,13 +316,17 @@ export async function fetchMaskLogs(
   if (params.startTime) query.set("start_time", params.startTime);
   if (params.endTime) query.set("end_time", params.endTime);
 
-  const res = await fetch(`${API_BASE}/mask-logs?${query}`);
+  const res = await fetch(`${API_BASE}/mask-logs?${query}`, {
+    headers: buildAuthHeaders(),
+  });
   if (!res.ok) throw new Error(`Failed to fetch logs: ${res.statusText}`);
   return res.json();
 }
 
 export async function fetchMaskSummary(): Promise<MaskSummary> {
-  const res = await fetch(`${API_BASE}/mask-stats`);
+  const res = await fetch(`${API_BASE}/mask-stats`, {
+    headers: buildAuthHeaders(),
+  });
   if (!res.ok) throw new Error(`Failed to fetch summary: ${res.statusText}`);
 
   const payload: MaskStatsResponse = await res.json();
@@ -343,7 +353,10 @@ export async function createMaskLog(params: {
 }) {
   const res = await fetch(`${API_BASE}/mask-log`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...buildAuthHeaders(),
+    },
     body: JSON.stringify({
       persons: params.persons,
       masked: params.masked,

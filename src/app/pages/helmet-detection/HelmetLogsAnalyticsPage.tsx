@@ -31,6 +31,7 @@ import {
   type HelmetLog,
   type HelmetSummary,
 } from "../../services/helmetApi";
+import { hasPremiumAccess } from "../../services/billingApi";
 
 const COLORS = ["#10b981", "#ef4444"];
 
@@ -125,6 +126,7 @@ function ImageLightbox({
 }
 
 function HelmetLogsAnalyticsPage() {
+  const canExport = hasPremiumAccess();
   const [dateRange, setDateRange] = useState("week");
   const [statusFilter, setStatusFilter] = useState("all");
   const [logs, setLogs] = useState<HelmetLog[]>([]);
@@ -270,6 +272,11 @@ function HelmetLogsAnalyticsPage() {
   );
 
   const exportCsv = () => {
+    if (!canExport) {
+      setErrorMessage("Exports are available after the organization upgrade.");
+      return;
+    }
+
     const rows = [
       ["Timestamp", "Persons", "Helmets", "No Helmet", "Status", "Confidence"],
       ...filteredLogs.map((log) => [
@@ -334,7 +341,11 @@ function HelmetLogsAnalyticsPage() {
           </button>
           <button
             onClick={exportCsv}
-            className="flex items-center gap-2 px-4 py-2 bg-linear-to-r from-orange-500 to-red-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all"
+            disabled={!canExport}
+            title={
+              canExport ? "Export Report" : "Upgrade required to export reports"
+            }
+            className="flex items-center gap-2 px-4 py-2 bg-linear-to-r from-orange-500 to-red-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
             Export Report

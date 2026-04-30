@@ -31,6 +31,7 @@ import {
   type MaskLog,
   type MaskSummary,
 } from "../../services/maskApi";
+import { hasPremiumAccess } from "../../services/billingApi";
 
 const COLORS = ["#10b981", "#ef4444", "#f59e0b"];
 
@@ -144,6 +145,7 @@ function StatusBadge({ status }: { status: string }) {
 
 // ── Main component ─────────────────────────────────────────────────────────────
 function MaskLogsAnalyticsPage() {
+  const canExport = hasPremiumAccess();
   const [dateRange, setDateRange] = useState("week");
   const [statusFilter, setStatusFilter] = useState("all");
   const [logs, setLogs] = useState<MaskLog[]>([]);
@@ -265,6 +267,11 @@ function MaskLogsAnalyticsPage() {
   );
 
   const exportCsv = () => {
+    if (!canExport) {
+      setErrorMessage("Exports are available after the organization upgrade.");
+      return;
+    }
+
     const rows = [
       [
         "Timestamp",
@@ -335,7 +342,11 @@ function MaskLogsAnalyticsPage() {
           </button>
           <button
             onClick={exportCsv}
-            className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-teal-500 to-green-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all"
+            disabled={!canExport}
+            title={
+              canExport ? "Export CSV" : "Upgrade required to export reports"
+            }
+            className="flex items-center gap-2 px-4 py-2 bg-linear-to-r from-teal-500 to-green-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Download className="w-4 h-4" />
             Export CSV

@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import os
 import numpy as np
@@ -12,6 +12,9 @@ from ultralytics import YOLO
 import torch
 import base64
 import time
+import random
+import string
+from werkzeug.security import check_password_hash, generate_password_hash
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -20,11 +23,16 @@ try:
     from supabase import create_client
 except Exception:
     create_client = None
+try:
+    import stripe
+except Exception:
+    stripe = None
 
 from insightface.app import FaceAnalysis
 from face_routes import register_face_routes
 from helmet_routes import register_helmet_routes
 from mask_routes import register_mask_routes
+from email_service import register_email_service, send_account_event_email
 
 app = Flask(__name__)
 CORS(app)
@@ -82,7 +90,6 @@ SUPABASE_STORAGE_BUCKET = os.environ.get('SUPABASE_STORAGE_BUCKET', 'fyp-assets'
 SUPABASE_RESIDENT_IMAGES_PREFIX = os.environ.get('SUPABASE_RESIDENT_IMAGES_PREFIX', 'residents').strip() or 'residents'
 SUPABASE_DETECTIONS_PREFIX = os.environ.get('SUPABASE_DETECTIONS_PREFIX', 'detections').strip() or 'detections'
 
-# KEY FIX: increase dedup window so near-identical stream frames don't all save
 STREAM_EVENT_WINDOW_SECONDS = max(int(os.environ.get('STREAM_EVENT_WINDOW_SECONDS', 5)), 1)
 
 _SUPABASE_CLIENT = None
@@ -123,7 +130,15 @@ def _supabase_payload_from_log(log_entry):
     return payload
 
 
-def _read_supabase_logs(table_name, limit=5000):
+def _get_request_company_id():
+    role = (request.headers.get('X-User-Role') or '').strip().lower()
+    company_id = (request.headers.get('X-Company-ID') or '').strip()
+    if role and role != 'admin' and company_id:
+        return company_id
+    return None
+
+
+def _read_supabase_logs(table_name, limit=5000, company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return None
@@ -133,6 +148,14 @@ def _read_supabase_logs(table_name, limit=5000):
         normalized = []
         for row in rows:
             item = dict(row)
+            item_company_id = str(item.get('company_id') or '').strip()
+            item_company_name = str(item.get('organization_name') or '').strip()
+            if company_id and item_company_id:
+                if item_company_id != company_id:
+                    continue
+            elif company_id and company_name:
+                if item_company_name != company_name:
+                    continue
             if 'id' not in item and 'local_id' in item:
                 item['id'] = item.get('local_id')
             normalized.append(item)
@@ -211,7 +234,6 @@ def _resident_image_storage_path(cnic, filename):
 
 def _detection_image_storage_path(module_name, camera_id, suffix='jpg'):
     camera_part = camera_id or 'default'
-    # Use timezone-aware datetime (fixes deprecation warning)
     ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
     return f"{SUPABASE_DETECTIONS_PREFIX}/{module_name}/{camera_part}/{ts}_{uuid4().hex[:8]}.{suffix.lstrip('.')}"
 
@@ -240,6 +262,382 @@ def _attach_storage_result_to_log(log_entry, storage_result):
 SUPABASE_RESIDENTS_TABLE = os.environ.get('SUPABASE_RESIDENTS_TABLE', 'residents').strip() or 'residents'
 SUPABASE_RESIDENT_IMAGES_TABLE = os.environ.get('SUPABASE_RESIDENT_IMAGES_TABLE', 'resident_images').strip() or 'resident_images'
 SUPABASE_RESIDENT_ENCODINGS_TABLE = os.environ.get('SUPABASE_RESIDENT_ENCODINGS_TABLE', 'resident_encodings').strip() or 'resident_encodings'
+SUPABASE_ORGANIZATIONS_TABLE = os.environ.get('SUPABASE_ORGANIZATIONS_TABLE', 'organizations').strip() or 'organizations'
+SUPABASE_ACCESS_USERS_TABLE = os.environ.get('SUPABASE_ACCESS_USERS_TABLE', 'access_users').strip() or 'access_users'
+FREE_ORG_MEMBER_LIMIT = max(int(os.environ.get('FREE_ORG_MEMBER_LIMIT', 5)), 1)
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '').strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '').strip()
+STRIPE_UPGRADE_PRICE_ID = os.environ.get('STRIPE_UPGRADE_PRICE_ID', '').strip()
+FRONTEND_BASE_URL = os.environ.get('FRONTEND_BASE_URL', 'http://127.0.0.1:5173').strip().rstrip('/')
+
+if stripe is not None and STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+
+def _verify_login_password(stored_hash, candidate_password):
+    if not stored_hash or not candidate_password:
+        return False
+
+    raw = str(stored_hash)
+
+    try:
+        if raw.startswith('pbkdf2:') or raw.startswith('scrypt:'):
+            return bool(check_password_hash(raw, candidate_password))
+
+        # Compatibility: some manually pasted hashes miss the "scrypt:" prefix
+        # and look like "32768:8:1$...$...".
+        if '$' in raw and raw.split('$', 1)[0].count(':') == 2:
+            return bool(check_password_hash(f"scrypt:{raw}", candidate_password))
+    except Exception:
+        pass
+
+    # Legacy/dev fallback where plaintext may be stored.
+    return raw == candidate_password
+
+
+def _fetch_access_user_by_identifier(identifier):
+    """Fetch a user ONLY by email, not username."""
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    ident = (identifier or '').strip().lower()
+    if not ident:
+        return None
+
+    # ONLY check by email
+    try:
+        by_email = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', ident).limit(1).execute()
+        if by_email.data:
+            return by_email.data[0]
+    except Exception:
+        logger.exception('Failed to read access user by email')
+
+    return None
+
+
+def _fetch_organization_name(organization_id):
+    if not organization_id:
+        return None
+
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    try:
+        response = client.table(SUPABASE_ORGANIZATIONS_TABLE).select('name').eq('id', organization_id).limit(1).execute()
+        if response.data:
+            return response.data[0].get('name')
+    except Exception:
+        logger.exception('Failed to read organization name')
+
+    return None
+
+
+def _fetch_organization(organization_id):
+    if not organization_id:
+        return None
+
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    try:
+        response = client.table(SUPABASE_ORGANIZATIONS_TABLE).select('*').eq('id', organization_id).limit(1).execute()
+        if response.data:
+            return response.data[0]
+    except Exception:
+        logger.exception('Failed to read organization')
+
+    return None
+
+
+def _organization_plan(organization):
+    plan = str((organization or {}).get('plan') or 'free').strip().lower()
+    return plan if plan in {'free', 'premium'} else 'free'
+
+
+def _organization_is_upgraded(organization):
+    return _organization_plan(organization) == 'premium'
+
+
+def _organization_billing_payload(organization):
+    plan = _organization_plan(organization)
+    return {
+        "plan": plan,
+        "is_upgraded": plan == 'premium',
+        "upgraded_at": (organization or {}).get('upgraded_at'),
+        "member_limit": None if plan == 'premium' else FREE_ORG_MEMBER_LIMIT,
+        "features": {
+            "unlimited_members": plan == 'premium',
+            "exports": plan == 'premium',
+            "periodic_email_reports": plan == 'premium',
+        },
+    }
+
+
+def _mark_organization_upgraded(organization_id, stripe_customer_id=None, stripe_checkout_session_id=None):
+    client = _get_supabase_client()
+    if client is None or not organization_id:
+        return False
+
+    payload = {
+        "plan": "premium",
+        "upgraded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if stripe_customer_id:
+        payload["stripe_customer_id"] = stripe_customer_id
+    if stripe_checkout_session_id:
+        payload["stripe_checkout_session_id"] = stripe_checkout_session_id
+
+    try:
+        client.table(SUPABASE_ORGANIZATIONS_TABLE).update(payload).eq('id', organization_id).execute()
+        return True
+    except Exception:
+        logger.exception('Failed to mark organization upgraded')
+        return False
+
+
+def _stripe_value(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    if hasattr(obj, key):
+        return getattr(obj, key)
+    getter = getattr(obj, 'get', None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            try:
+                return getter(key)
+            except Exception:
+                return default
+        except Exception:
+            return default
+    return default
+
+
+def _should_notify_member_role(role):
+    return str(role or '').strip().lower() in {'manager', 'operator', 'viewer'}
+
+
+def _send_member_account_event(member, event_type, actor_name=None, is_active=None):
+    role = str((member or {}).get('role') or '').strip().lower()
+    if not _should_notify_member_role(role):
+        return False
+
+    try:
+        return send_account_event_email(
+            logger=logger,
+            to_address=(member or {}).get('email'),
+            event_type=event_type,
+            member_role=role,
+            organization_name=(member or {}).get('organization_name'),
+            display_name=(member or {}).get('display_name') or (member or {}).get('username'),
+            actor_name=actor_name,
+            is_active=is_active,
+        )
+    except Exception:
+        logger.exception('Failed to send %s account email to %s', event_type, (member or {}).get('email'))
+        return False
+
+
+def _organization_member_count(organization_id):
+    client = _get_supabase_client()
+    if client is None or not organization_id:
+        return 0
+
+    try:
+        result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('id', count='exact').eq('organization_id', organization_id).execute()
+        return int(result.count or len(result.data or []))
+    except Exception:
+        logger.exception('Failed to count organization members')
+        return 0
+
+def _generate_unique_org_code():
+    """Generate a random 6-character unique organization code."""
+    import random
+    import string
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+def _resolve_or_create_organization(name, code=None, owner_email=None):
+    """Create a new organization row. Name duplicates are allowed."""
+    client = _get_supabase_client()
+    if client is None:
+        logger.error("Supabase client not available")
+        return None
+    
+    org_name = (name or '').strip()
+    if not org_name:
+        return None
+    base_org_name = org_name
+    candidate_org_name = org_name
+
+    # Always create a new organization, even if another org has the same name.
+    logger.info(f"Creating NEW organization '{org_name}' for owner {owner_email or 'unknown'}")
+
+    # If caller provided a code, try it once first, then fall back to random codes.
+    preferred_code = (code or '').strip() or None
+    for attempt in range(10):
+        if preferred_code and attempt == 0:
+            org_code = preferred_code
+        else:
+            org_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        try:
+            created = client.table(SUPABASE_ORGANIZATIONS_TABLE).insert({
+                "name": candidate_org_name,
+                "code": org_code, 
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+            
+            if created.data and len(created.data) > 0:
+                logger.info(f"✅ Created NEW org '{candidate_org_name}' with code '{org_code}' for owner {owner_email or 'unknown'}")
+                return created.data[0]
+            else:
+                # Insert may have succeeded even if response data is empty - try to fetch it
+                try:
+                    fetch_result = client.table(SUPABASE_ORGANIZATIONS_TABLE).select('*').eq('code', org_code).limit(1).execute()
+                    if fetch_result.data and len(fetch_result.data) > 0:
+                        logger.info(f"✅ Created NEW org '{candidate_org_name}' with code '{org_code}' (fetched after empty response)")
+                        return fetch_result.data[0]
+                except:
+                    pass
+        except Exception as e:
+            error_text = str(e).lower()
+            if '23505' in error_text:
+                # If DB enforces unique organization names, keep the base visible name but add a suffix.
+                if 'organizations_name_key' in error_text or "'name'" in error_text or ' name ' in error_text:
+                    suffix = uuid4().hex[:6].upper()
+                    candidate_org_name = f"{base_org_name} ({suffix})"
+                    logger.warning(
+                        f"Duplicate organization name '{base_org_name}', retrying with '{candidate_org_name}'"
+                    )
+                    continue
+
+                # Unique code collision: retry with a different generated code.
+                logger.warning(f"Duplicate code '{org_code}', retrying with new code...")
+                continue
+            else:
+                logger.error(f"Failed to create organization: {e}")
+                return None
+    
+    logger.error(f"Failed to create organization after 10 attempts")
+    return None
+
+def _count_access_users():
+    client = _get_supabase_client()
+    if client is None:
+        return 0
+    try:
+        result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('id', count='exact').limit(1).execute()
+        return int(getattr(result, 'count', 0) or 0)
+    except Exception:
+        logger.exception('Failed to count access users')
+        return 0
+
+
+def _create_access_user(*, email, username, display_name, password, role, organization_id=None, organization_name=None):
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    clean_email = (email or '').strip().lower()
+    clean_username = (username or '').strip().lower() or None
+    clean_display_name = (display_name or '').strip() or None
+    clean_role = (role or 'operator').strip().lower()
+    if not clean_email or not password:
+        return None
+
+    payload = {
+        "email": clean_email,
+        "username": clean_username,
+        "display_name": clean_display_name,
+        "password_hash": generate_password_hash(password),
+        "role": clean_role,
+        "organization_id": organization_id,
+        "organization_name": organization_name,
+        "is_active": True,
+    }
+
+    try:
+        result = client.table(SUPABASE_ACCESS_USERS_TABLE).insert(payload).execute()
+        if result.data:
+            logger.info(f"Access user '{clean_email}' created successfully with role '{clean_role}'")
+            return result.data[0]
+        else:
+            logger.error(f"Insert succeeded but no data returned for user '{clean_email}'")
+            # Try to fetch the newly created user
+            try:
+                fetch_result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', clean_email).limit(1).execute()
+                if fetch_result.data:
+                    return fetch_result.data[0]
+            except:
+                pass
+    except Exception:
+        logger.exception('Failed to create access user')
+        return None
+
+
+def _request_actor_user():
+    actor_email = (request.headers.get('X-User-Email') or '').strip().lower()
+    if not actor_email:
+        return None
+    return _fetch_access_user_by_identifier(actor_email)
+
+
+def _check_enrollment_permission():
+    """Check if user is allowed to enroll residents (viewer only is blocked)."""
+    actor = _request_actor_user()
+    if not actor:
+        return False, ("Authentication required", 401)
+    
+    role = (actor.get('role') or '').lower()
+    if role == 'viewer':
+        return False, (f"Role '{role}' does not have permission to enroll residents", 403)
+    
+    return True, None
+
+
+def _check_directory_permission():
+    """Check if user is allowed to view resident directory (viewer only is blocked)."""
+    actor = _request_actor_user()
+    if not actor:
+        return False, ("Authentication required", 401)
+    
+    role = (actor.get('role') or '').lower()
+    if role == 'viewer':
+        return False, (f"Role '{role}' does not have permission to view resident directory", 403)
+    
+    return True, None
+
+
+def _check_capture_permission():
+    """Check if user is allowed to use capture/stream endpoints (viewer is blocked)."""
+    actor = _request_actor_user()
+    if not actor:
+        return False, ("Authentication required", 401)
+
+    role = (actor.get('role') or '').lower()
+    if role == 'viewer':
+        return False, (f"Role '{role}' does not have permission to use capture features", 403)
+
+    return True, None
+
+
+def _check_delete_permission():
+    """Check if user is allowed to delete residents (only owner/admin)"""
+    actor = _request_actor_user()
+    if not actor:
+        return False, ("Authentication required", 401)
+    
+    role = (actor.get('role') or '').lower()
+    if role not in ('owner', 'admin'):
+        return False, (f"Role '{role}' does not have permission to delete residents", 403)
+    
+    return True, None
 
 
 def _insert_resident_supabase(resident_data):
@@ -264,7 +662,28 @@ def _insert_resident_supabase(resident_data):
             except Exception as fetch_err:
                 logger.error(f"Failed to fetch inserted resident: {str(fetch_err)}")
             return None
-    except Exception:
+    except Exception as first_err:
+        error_text = str(first_err).lower()
+        if 'column' in error_text and ('organization_id' in error_text or 'organization_name' in error_text):
+            fallback_payload = {
+                k: v
+                for k, v in clean_payload.items()
+                if k not in {'organization_id', 'organization_name'}
+            }
+            if fallback_payload != clean_payload:
+                try:
+                    logger.warning(
+                        f"Retrying resident insert without org columns for {resident_data.get('cnic')}"
+                    )
+                    result = client.table(SUPABASE_RESIDENTS_TABLE).insert(fallback_payload).execute()
+                    if result and hasattr(result, 'data') and result.data:
+                        return result.data[0]
+                    fetch_result = client.table(SUPABASE_RESIDENTS_TABLE).select("*").eq("cnic", resident_data.get('cnic')).execute()
+                    if fetch_result and fetch_result.data:
+                        return fetch_result.data[0]
+                except Exception:
+                    logger.exception(f"Supabase fallback insert failed for resident {resident_data.get('cnic')}")
+                    return None
         logger.exception(f"Supabase insert failed for resident {resident_data.get('cnic')}")
         return None
 
@@ -291,25 +710,48 @@ def _delete_resident_supabase(cnic):
         logger.exception(f"Supabase delete failed for resident {cnic}")
 
 
-def _read_resident_supabase(cnic):
+def _resident_matches_scope(resident, company_id=None, company_name=None):
+    if company_id:
+        resident_company_id = str(resident.get('organization_id') or '').strip()
+        if resident_company_id != company_id:
+            return False
+    if company_name:
+        resident_company_name = str(resident.get('organization_name') or '').strip()
+        if resident_company_name != company_name:
+            return False
+    return True
+
+
+def _read_resident_supabase(cnic, company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return None
     try:
         response = client.table(SUPABASE_RESIDENTS_TABLE).select('*').eq('cnic', cnic).single().execute()
-        return response.data if response.data else None
+        resident = response.data if response.data else None
+        if resident is not None and not _resident_matches_scope(resident, company_id=company_id, company_name=company_name):
+            return None
+        return resident
     except Exception:
         logger.exception(f"Supabase read failed for resident {cnic}")
         return None
 
 
-def _read_all_residents_supabase():
+def _read_all_residents_supabase(company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return None
     try:
         response = client.table(SUPABASE_RESIDENTS_TABLE).select('*').order('enrolled_at', desc=True).execute()
-        return response.data or [] if response.data is not None else None
+        residents = response.data or [] if response.data is not None else None
+        if residents is None:
+            return None
+        if company_id or company_name:
+            residents = [
+                resident for resident in residents
+                if _resident_matches_scope(resident, company_id=company_id, company_name=company_name)
+            ]
+        return residents
     except Exception:
         logger.exception("Supabase read failed for all residents")
         return None
@@ -338,11 +780,15 @@ def _insert_resident_images_supabase(cnic, images_list):
         logger.exception(f"Supabase insert images failed for resident {cnic}")
 
 
-def _read_resident_images_supabase(cnic):
+def _read_resident_images_supabase(cnic, company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return None
     try:
+        if company_id or company_name:
+            resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
+            if resident is None:
+                return []
         response = (
             client.table(SUPABASE_RESIDENT_IMAGES_TABLE)
             .select('filename,storage_path,public_url')
@@ -424,8 +870,6 @@ MASK_STREAM_TTA     = _env_flag('MASK_STREAM_TTA', False)
 MASK_MODEL_PATH_ENV = os.environ.get('MASK_MODEL_PATH', '').strip()
 MASK_MODEL = None
 
-# KEY FIX: stream images at 320px — 9× fewer pixels than 960, massively faster
-# Upload can keep higher quality for accuracy
 MASK_UPLOAD_IMGSZ = int(os.environ.get('MASK_UPLOAD_IMGSZ', 640))
 MASK_STREAM_IMGSZ = int(os.environ.get('MASK_STREAM_IMGSZ', 320))
 
@@ -462,8 +906,8 @@ def append_helmet_log(log_entry):
         _write_helmet_logs_unlocked(logs)
     _append_supabase_log(SUPABASE_HELMET_TABLE, log_entry)
 
-def read_helmet_logs():
-    return _read_supabase_logs(SUPABASE_HELMET_TABLE) or []
+def read_helmet_logs(company_id=None, company_name=None):
+    return _read_supabase_logs(SUPABASE_HELMET_TABLE, company_id=company_id, company_name=company_name) or []
 
 
 # ==============================================================================
@@ -496,15 +940,15 @@ def append_mask_log(log_entry):
         _write_mask_logs_unlocked(logs)
     _append_supabase_log(SUPABASE_MASK_TABLE, log_entry)
 
-def read_mask_logs():
-    return _read_supabase_logs(SUPABASE_MASK_TABLE) or []
+def read_mask_logs(company_id=None, company_name=None):
+    return _read_supabase_logs(SUPABASE_MASK_TABLE, company_id=company_id, company_name=company_name) or []
 
 def summarize_mask_logs(logs):
-    total         = len(logs)
-    compliant     = sum(1 for l in logs if l.get('status') == 'Compliant')
-    non_compliant = sum(1 for l in logs if l.get('status') == 'Non-Compliant')
-    no_person     = sum(1 for l in logs if l.get('status') == 'No Persons Detected')
-    avg_conf      = round(sum(float(l.get('confidence', 0) or 0) for l in logs) / total, 2) if total > 0 else 0
+    total           = len(logs)
+    compliant       = sum(1 for l in logs if l.get('status') == 'Compliant')
+    non_compliant   = sum(1 for l in logs if l.get('status') == 'Non-Compliant')
+    no_person       = sum(1 for l in logs if l.get('status') == 'No Persons Detected')
+    avg_conf        = round(sum(float(l.get('confidence', 0) or 0) for l in logs) / total, 2) if total > 0 else 0
     compliance_rate = round((compliant / total) * 100, 2) if total > 0 else 0
     return {
         "total_detections":     total,
@@ -526,7 +970,6 @@ def load_helmet_model():
         return HELMET_MODEL
 
     with _MODEL_LOAD_LOCK:
-        # Double-checked locking: another thread may have loaded it while we waited
         if HELMET_MODEL is not None:
             return HELMET_MODEL
 
@@ -548,7 +991,6 @@ def load_helmet_model():
         finally:
             torch.load = original_torch_load
 
-        # Warm-up inference — compiles CUDA kernels / JIT so first real request is fast
         dummy = np.zeros((320, 320, 3), dtype=np.uint8)
         HELMET_MODEL(dummy, verbose=False)
         logger.info(f"Helmet model ready. Classes: {HELMET_MODEL.names}")
@@ -611,7 +1053,6 @@ def load_mask_model():
         finally:
             torch.load = original_torch_load
 
-        # Warm-up at stream resolution (320px) — this is the hot path
         dummy = np.zeros((320, 320, 3), dtype=np.uint8)
         MASK_MODEL(dummy, imgsz=MASK_STREAM_IMGSZ, verbose=False)
         logger.info(f"Mask model ready. Classes: {MASK_MODEL.names}")
@@ -641,9 +1082,10 @@ NO_HELMET_LABELS = {
 HEAD_LABELS   = {_normalize_helmet_label(label) for label in ('head',)}
 PERSON_LABELS = {_normalize_helmet_label(label) for label in ('person', 'worker', 'human', 'pedestrian', 'people')}
 
+# Green for helmet, red for no-helmet — keys match det_type values set below
 _HELMET_BOX_COLORS = {
-    "helmet":    (34, 197, 94),
-    "no_helmet": (239, 68, 68),
+    "with_helmet":    (34, 197, 94),   # green
+    "without_helmet": (239, 68, 68),   # red
 }
 _HELMET_DEFAULT_COLOR = (148, 163, 184)
 
@@ -699,52 +1141,86 @@ def _draw_helmet_boxes(image_path: str, detections: list) -> str:
     return f"data:image/jpeg;base64,{base64.b64encode(buf).decode('utf-8')}"
 
 
-def detect_helmets_simple(image_path):
-    model   = load_helmet_model()
-    results = model(image_path, conf=HELMET_CONF_THRESHOLD, verbose=False)
-    helmets = no_helmet = 0
-    detections = []
+def detect_helmets_simple(image_path, conf_threshold=0.25, iou_threshold=0.3):
+    try:
+        helmet_model = load_helmet_model()
+        results = helmet_model(image_path, conf=conf_threshold, iou=iou_threshold)
 
-    for result in results:
-        if result.boxes is None or len(result.boxes) == 0:
-            logger.info("No boxes detected in this frame.")
-            continue
-        logger.info(f"Total boxes detected: {len(result.boxes)}")
-        for box in result.boxes:
-            cls_id = int(box.cls[0].item())
-            conf   = float(box.conf[0].item())
-            label  = model.names[cls_id].lower().strip()
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            logger.info(f"  Detected: cls_id={cls_id}, label='{label}', conf={conf:.2f}")
+        detections = []
+        helmets = 0
+        no_helmet = 0
+        person_count = 0
 
-            if label in HELMET_LABELS:
-                helmets += 1
-                detections.append({"label": "Helmet",               "confidence": round(conf * 100, 2), "type": "helmet",    "bbox": [x1, y1, x2, y2]})
-            elif label in NO_HELMET_LABELS:
-                no_helmet += 1
-                detections.append({"label": "No Helmet",            "confidence": round(conf * 100, 2), "type": "no_helmet", "bbox": [x1, y1, x2, y2]})
-            else:
-                logger.warning(f"  Unknown label '{label}' — treating as no_helmet")
-                no_helmet += 1
-                detections.append({"label": f"No Helmet ({label})", "confidence": round(conf * 100, 2), "type": "no_helmet", "bbox": [x1, y1, x2, y2]})
+        for result in results:
+            boxes = result.boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                bbox = box.xyxy[0].tolist()
+                label = helmet_model.names[cls_id]
+                norm_label = _normalize_helmet_label(label)
 
-    persons = helmets + no_helmet
-    if persons == 0:
-        status, compliance = "No Persons Detected", True
-    elif no_helmet > 0:
-        status, compliance = "Violation", False
-    else:
-        status, compliance = "Compliant", True
+                if norm_label in HELMET_LABELS:
+                    det_type = "with_helmet"
+                    helmets += 1
+                elif norm_label in NO_HELMET_LABELS:
+                    det_type = "without_helmet"
+                    no_helmet += 1
+                elif norm_label in PERSON_LABELS:
+                    person_count += 1
+                    continue  # no bounding box drawn for generic person label
+                else:
+                    continue  # skip head labels and anything unknown
 
-    all_confs       = [d["confidence"] for d in detections]
-    avg_confidence  = round(sum(all_confs) / len(all_confs), 2) if all_confs else 0.0
-    annotated_image = _draw_helmet_boxes(image_path, detections)
+                detections.append({
+                    "label": label,
+                    "type": det_type,       # "with_helmet" → green, "without_helmet" → red
+                    "confidence": conf,
+                    "bbox": [int(x) for x in bbox],
+                })
 
-    return {
-        "persons": persons, "helmets": helmets, "no_helmet": no_helmet,
-        "status": status, "compliance": compliance, "confidence": avg_confidence,
-        "detections": detections, "annotated_image": annotated_image,
-    }
+        # Each helmet/no-helmet box represents exactly one head → one person
+        persons = helmets + no_helmet
+        # Fallback: model only emits PERSON labels with no helmet breakdown
+        if persons == 0 and person_count > 0:
+            persons = person_count
+
+        avg_conf = (sum(d["confidence"] for d in detections) / len(detections)) * 100 if detections else 0
+
+        if persons == 0:
+            status, compliance = "No Persons Detected", False
+        elif no_helmet == 0:
+            status, compliance = "Compliant", True
+        else:
+            status, compliance = "Violation", False
+
+        annotated_img = _draw_helmet_boxes(image_path, detections)
+
+        return {
+            "persons": persons,
+            "helmets": helmets,
+            "no_helmet": no_helmet,
+            "status": status,
+            "compliance": compliance,
+            "confidence": round(avg_conf, 2),
+            "annotated_image": annotated_img,
+            "detections": detections,
+        }
+
+    except Exception as e:
+        logger.error(f"Helmet detection error: {e}")
+        return {
+            "persons": 0,
+            "helmets": 0,
+            "no_helmet": 0,
+            "status": "No Persons Detected",
+            "compliance": False,
+            "confidence": 0,
+            "annotated_image": None,
+            "detections": [],
+        }
 
 
 # ==============================================================================
@@ -796,7 +1272,6 @@ def _mask_inference_kwargs(mode: str) -> dict:
     return {
         "conf":    MASK_CONF_THRESHOLD,
         "iou":     MASK_IOU_THRESHOLD,
-        # KEY FIX: 320 for stream (was 960 — 9× more pixels with no benefit)
         "imgsz":   MASK_STREAM_IMGSZ if is_stream else MASK_UPLOAD_IMGSZ,
         "max_det": MASK_MAX_DET,
         "augment": MASK_STREAM_TTA if is_stream else MASK_UPLOAD_TTA,
@@ -844,8 +1319,8 @@ def detect_masks_core(image_path: str, mode: str = 'upload') -> dict:
     else:
         status, compliance = "Compliant", True
 
-    all_confs       = [d["confidence"] for d in detections]
-    avg_confidence  = round(sum(all_confs) / len(all_confs), 2) if all_confs else 0.0
+    all_confs      = [d["confidence"] for d in detections]
+    avg_confidence = round(sum(all_confs) / len(all_confs), 2) if all_confs else 0.0
     annotated_image = _draw_mask_boxes(image_path, detections)
 
     return {
@@ -1008,21 +1483,48 @@ def _append_supabase_log(table_name, log_entry):
         return
     try:
         payload = _supabase_payload_from_log(log_entry)
-        # Strip fields that don't exist in the DB schema
         for field in ['annotated_image_path', 'annotated_image_url', 'local_id']:
             payload.pop(field, None)
-        # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
-        # Restrict to known columns for face logs; for others allow all non-None
         if table_name == SUPABASE_FACE_TABLE:
             allowed = {'id', 'timestamp', 'name', 'cnic', 'status', 'confidence',
-                       'source', 'camera_id', 'file_name', 'annotated_image', 'bbox'}
+                       'source', 'camera_id', 'file_name', 'annotated_image', 'bbox', 'company_id', 'organization_id', 'organization_name'}
             payload = {k: v for k, v in payload.items() if k in allowed}
         logger.debug(f"Inserting into {table_name}: {list(payload.keys())}")
         client.table(table_name).insert(payload).execute()
         logger.info(f"✅ Successfully saved log to {table_name}")
-    except Exception as e:
-        logger.error(f"❌ Supabase insert failed for {table_name}: {str(e)}")
+    except Exception as first_err:
+        error_text = str(first_err).lower()
+        if ('column' in error_text or 'schema cache' in error_text) and any(field in error_text for field in ('company_id', 'organization_id', 'organization_name')):
+            fallback_payload = {
+                k: v
+                for k, v in payload.items()
+                if k != 'company_id'
+            }
+            if fallback_payload != payload:
+                try:
+                    logger.warning(f"Retrying log insert into {table_name} without company_id")
+                    client.table(table_name).insert(fallback_payload).execute()
+                    logger.info(f"✅ Successfully saved fallback log to {table_name}")
+                    return
+                except Exception as fallback_err:
+                    logger.warning(f"company_id fallback insert failed for {table_name}: {str(fallback_err)}")
+
+            fallback_payload = {
+                k: v
+                for k, v in payload.items()
+                if k not in {'company_id', 'organization_id', 'organization_name'}
+            }
+            if fallback_payload != payload:
+                try:
+                    logger.warning(f"Retrying log insert into {table_name} without org columns")
+                    client.table(table_name).insert(fallback_payload).execute()
+                    logger.info(f"✅ Successfully saved fallback log to {table_name}")
+                    return
+                except Exception as fallback_err:
+                    logger.error(f"❌ Supabase fallback insert failed for {table_name}: {str(fallback_err)}")
+                    return
+        logger.error(f"❌ Supabase insert failed for {table_name}: {str(first_err)}")
 
 
 def append_face_log(entry):
@@ -1034,9 +1536,9 @@ def append_face_log(entry):
         _write_face_logs_unlocked(logs)
     _append_supabase_log(SUPABASE_FACE_TABLE, entry)
 
-def read_face_logs():
+def read_face_logs(company_id=None, company_name=None):
     try:
-        cloud_logs = _read_supabase_logs(SUPABASE_FACE_TABLE)
+        cloud_logs = _read_supabase_logs(SUPABASE_FACE_TABLE, company_id=company_id, company_name=company_name)
         if cloud_logs:
             logger.info(f"Returning {len(cloud_logs)} logs from Supabase")
             return cloud_logs
@@ -1044,48 +1546,796 @@ def read_face_logs():
         logger.warning(f"Failed to read from Supabase: {e}")
     with FACE_LOG_LOCK:
         local_logs = _read_face_logs_unlocked()
+        if company_id:
+            local_logs = [
+                log for log in local_logs
+                if str(log.get('company_id') or '').strip() == company_id
+            ]
         logger.info(f"Returning {len(local_logs)} logs from local file")
         return local_logs
 
 
 # ==============================================================================
-# DASHBOARD ENDPOINT
+# AUTH ENDPOINTS
 # ==============================================================================
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    try:
+        payload = request.get_json(silent=True) or {}
+        identifier = (payload.get('identifier') or payload.get('email') or '').strip()
+        password = str(payload.get('password') or '')
+
+        if not identifier or not password:
+            return jsonify({"status": "error", "message": "Identifier and password are required"}), 400
+
+        user = _fetch_access_user_by_identifier(identifier)
+        if not user:
+            return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+
+        if user.get('is_active') is False:
+            return jsonify({"status": "error", "message": "This account is inactive"}), 403
+
+        if not _verify_login_password(user.get('password_hash'), password):
+            return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+
+        role = str(user.get('role') or 'operator').strip().lower()
+        organization_id = user.get('organization_id')
+        organization = _fetch_organization(organization_id)
+        organization_name = user.get('organization_name') or (organization or {}).get('name') or _fetch_organization_name(organization_id)
+
+        return jsonify({
+            "status": "success",
+            "message": "Login successful",
+            "data": {
+                "user": {
+                    "id": user.get('id'),
+                    "email": user.get('email'),
+                    "display_name": user.get('display_name') or user.get('username') or user.get('email'),
+                    "role": role,
+                    "organization_id": organization_id,
+                    "organization_name": organization_name,
+                    "is_active": user.get('is_active', True),
+                    "billing": _organization_billing_payload(organization),
+                }
+            }
+        })
+    except Exception as e:
+        logger.exception('auth_login error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/bootstrap-owner', methods=['POST'])
+def auth_bootstrap_owner():
+    try:
+        if _count_access_users() > 0:
+            return jsonify({"status": "error", "message": "Bootstrap owner is already configured"}), 409
+
+        payload = request.get_json(silent=True) or {}
+        organization_name = (payload.get('organization_name') or '').strip()
+        organization_code = (payload.get('organization_code') or '').strip() or None
+        email = (payload.get('email') or '').strip()
+        username = (payload.get('username') or '').strip() or None
+        display_name = (payload.get('display_name') or '').strip() or None
+        password = str(payload.get('password') or '')
+
+        if not organization_name or not email or not password:
+            return jsonify({"status": "error", "message": "organization_name, email and password are required"}), 400
+
+        if _fetch_access_user_by_identifier(email) is not None:
+            return jsonify({"status": "error", "message": "An account with this email already exists"}), 409
+
+        org = _resolve_or_create_organization(organization_name, organization_code, owner_email=email)
+        if not org:
+            return jsonify({"status": "error", "message": "Failed to create organization"}), 500
+
+        created = _create_access_user(
+            email=email,
+            username=username,
+            display_name=display_name,
+            password=password,
+            role='owner',
+            organization_id=org.get('id'),
+            organization_name=org.get('name'),
+        )
+        if not created:
+            return jsonify({"status": "error", "message": "Failed to create owner account"}), 500
+
+        return jsonify({
+            "status": "success",
+            "message": "Organization owner created",
+            "data": {
+                "organization": {
+                    "id": org.get('id'),
+                    "name": org.get('name'),
+                    "code": org.get('code'),
+                },
+                "owner": {
+                    "id": created.get('id'),
+                    "email": created.get('email'),
+                    "username": created.get('username'),
+                    "display_name": created.get('display_name'),
+                    "role": created.get('role'),
+                }
+            }
+        })
+    except Exception as e:
+        logger.exception('auth_bootstrap_owner error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/members', methods=['GET'])
+def auth_list_members():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        actor_org = actor.get('organization_id')
+        client = _get_supabase_client()
+        if client is None:
+            return jsonify({"status": "error", "message": "Supabase client not available"}), 500
+
+        query = client.table(SUPABASE_ACCESS_USERS_TABLE).select('id,email,username,display_name,role,organization_id,organization_name,is_active,created_at').order('created_at', desc=True)
+        if actor_role != 'admin':
+            query = query.eq('organization_id', actor_org)
+
+        result = query.execute()
+        return jsonify({"status": "success", "data": {"members": result.data or []}})
+    except Exception as e:
+        logger.exception('auth_list_members error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/organizations', methods=['GET'])
+def auth_list_organizations():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'admin':
+            return jsonify({"status": "error", "message": "Only admin can list all organizations"}), 403
+
+        client = _get_supabase_client()
+        if not client:
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+
+        # Fetch all organizations
+        orgs_result = client.table(SUPABASE_ORGANIZATIONS_TABLE).select('*').order('created_at', desc=True).execute()
+        organizations = orgs_result.data or []
+
+        # For each organization, fetch the owner info
+        orgs_with_owners = []
+        for org in organizations:
+            org_id = org.get('id')
+            # Fetch owner of this organization
+            owner_result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('organization_id', org_id).eq('role', 'owner').eq('is_active', True).execute()
+            owner = owner_result.data[0] if owner_result.data else None
+
+            orgs_with_owners.append({
+                "id": org.get('id'),
+                "name": org.get('name'),
+                "code": org.get('code'),
+                "is_active": org.get('is_active', True),
+                "created_at": org.get('created_at'),
+                "owner_email": owner.get('email') if owner else None,
+                "owner_name": owner.get('display_name') if owner else None,
+                "billing": _organization_billing_payload(org),
+            })
+
+        logger.info(f"Returning {len(orgs_with_owners)} organizations")
+        return jsonify({
+            "status": "success",
+            "data": {
+                "organizations": orgs_with_owners
+            }
+        })
+    except Exception as e:
+        logger.exception('auth_list_organizations error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/organizations/<org_id>', methods=['DELETE'])
+def auth_delete_organization(org_id):
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'admin':
+            return jsonify({"status": "error", "message": "Only admin can delete organizations"}), 403
+
+        client = _get_supabase_client()
+        if not client:
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+
+        # Permanent delete: remove organization users and the organization row.
+        client.table(SUPABASE_ACCESS_USERS_TABLE).delete().eq('organization_id', org_id).execute()
+        client.table(SUPABASE_ORGANIZATIONS_TABLE).delete().eq('id', org_id).execute()
+
+        logger.info(f"Organization {org_id} permanently deleted by {actor.get('email')}")
+        return jsonify({"status": "success", "message": "Organization deleted permanently"})
+    except Exception as e:
+        logger.exception('auth_delete_organization error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/organizations/<org_id>/status', methods=['PATCH'])
+def auth_update_organization_status(org_id):
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'admin':
+            return jsonify({"status": "error", "message": "Only admin can update organization status"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        if 'is_active' not in payload:
+            return jsonify({"status": "error", "message": "is_active is required"}), 400
+
+        is_active = bool(payload.get('is_active'))
+
+        client = _get_supabase_client()
+        if not client:
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+
+        client.table(SUPABASE_ORGANIZATIONS_TABLE).update({'is_active': is_active}).eq('id', org_id).execute()
+        client.table(SUPABASE_ACCESS_USERS_TABLE).update({'is_active': is_active}).eq('organization_id', org_id).execute()
+
+        action = 'activated' if is_active else 'deactivated'
+        logger.info(f"Organization {org_id} {action} by {actor.get('email')}")
+        return jsonify({"status": "success", "message": f"Organization {action} successfully"})
+    except Exception as e:
+        logger.exception('auth_update_organization_status error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/organizations/owner', methods=['POST'])
+def auth_create_organization_owner():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'admin':
+            return jsonify({"status": "error", "message": "Only admin can create organization owners"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        organization_name = (payload.get('organization_name') or '').strip()
+        organization_code = (payload.get('organization_code') or '').strip() or None
+        email = (payload.get('email') or '').strip()
+        username = (payload.get('username') or '').strip() or None
+        display_name = (payload.get('display_name') or '').strip() or None
+        password = str(payload.get('password') or '')
+
+        if not organization_name or not email or not password:
+            return jsonify({"status": "error", "message": "organization_name, email and password are required"}), 400
+
+        # ONLY check email - not username
+        existing_user = _fetch_access_user_by_identifier(email)
+        if existing_user is not None:
+            return jsonify({
+                "status": "error", 
+                "message": "An account with this email already exists. Please use a different email."
+            }), 409
+
+        # Create the organization first
+        logger.info(f"Creating organization '{organization_name}'...")
+        org = _resolve_or_create_organization(organization_name, organization_code, owner_email=email)
+        
+        if not org:
+            logger.error(f"Failed to create organization '{organization_name}'")
+            return jsonify({
+                "status": "error", 
+                "message": "Failed to create organization. The organization code may already exist. Please try again with a different name."
+            }), 500
+        
+        org_id = org.get('id')
+        org_name = org.get('name')
+        org_code_result = org.get('code')
+        
+        logger.info(f"Organization created/found: id={org_id}, name={org_name}, code={org_code_result}")
+        
+        # Now create the owner user
+        logger.info(f"Creating owner user '{email}' for organization '{org_name}'...")
+        created = _create_access_user(
+            email=email,
+            username=username,
+            display_name=display_name,
+            password=password,
+            role='owner',
+            organization_id=org_id,
+            organization_name=org_name,
+        )
+        
+        if not created:
+            logger.error(f"Failed to create owner user '{email}'")
+            # If user creation fails, we should clean up the organization
+            try:
+                client = _get_supabase_client()
+                if client:
+                    client.table(SUPABASE_ORGANIZATIONS_TABLE).delete().eq('id', org_id).execute()
+                    logger.info(f"Cleaned up organization '{org_id}' after failed user creation")
+            except:
+                pass
+            return jsonify({
+                "status": "error", 
+                "message": "Failed to create owner account. Please try again."
+            }), 500
+
+        logger.info(f"✅ Successfully created organization '{org_name}' with owner '{email}'")
+
+        return jsonify({
+            "status": "success",
+            "message": "Organization and owner created successfully",
+            "data": {
+                "organization": {
+                    "id": org_id,
+                    "name": org_name,
+                    "code": org_code_result,
+                    "is_active": org.get('is_active', True),
+                    "created_at": org.get('created_at'),
+                },
+                "owner": {
+                    "id": created.get('id'),
+                    "email": created.get('email'),
+                    "username": created.get('username'),
+                    "display_name": created.get('display_name'),
+                    "role": created.get('role'),
+                    "organization_id": created.get('organization_id'),
+                    "organization_name": created.get('organization_name'),
+                }
+            }
+        })
+    except Exception as e:
+        logger.exception('auth_create_organization_owner error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/auth/members', methods=['POST'])
+def auth_create_member():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role not in ('admin', 'owner'):
+            return jsonify({"status": "error", "message": "Only admin or owner can add members"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        email = (payload.get('email') or '').strip()
+        username = (payload.get('username') or '').strip() or None
+        display_name = (payload.get('display_name') or '').strip() or None
+        password = str(payload.get('password') or '')
+        requested_role = str(payload.get('role') or 'operator').strip().lower()
+
+        if not email or not password:
+            return jsonify({"status": "error", "message": "email and password are required"}), 400
+
+        if requested_role not in ('owner', 'manager', 'operator', 'viewer', 'admin'):
+            return jsonify({"status": "error", "message": "Invalid role"}), 400
+
+        if actor_role == 'owner' and requested_role in ('owner', 'admin'):
+            return jsonify({"status": "error", "message": "Owner can add manager/operator/viewer only"}), 403
+
+        # ONLY check email - not username
+        if _fetch_access_user_by_identifier(email) is not None:
+            return jsonify({"status": "error", "message": "An account with this email already exists"}), 409
+
+        actor_org_id = actor.get('organization_id')
+        actor_org_name = actor.get('organization_name') or _fetch_organization_name(actor_org_id)
+
+        organization_id = actor_org_id
+        organization_name = actor_org_name
+
+        if actor_role == 'admin':
+            organization_id = payload.get('organization_id') or actor_org_id
+            organization_name = payload.get('organization_name') or _fetch_organization_name(organization_id)
+        elif actor_role == 'owner':
+            organization = _fetch_organization(actor_org_id)
+            if not _organization_is_upgraded(organization):
+                member_count = _organization_member_count(actor_org_id)
+                if member_count >= FREE_ORG_MEMBER_LIMIT:
+                    return jsonify({
+                        "status": "error",
+                        "message": f"Free organizations can have up to {FREE_ORG_MEMBER_LIMIT} total members. Inactive accounts still count toward the limit. Upgrade for unlimited members.",
+                        "code": "upgrade_required",
+                        "data": {"member_limit": FREE_ORG_MEMBER_LIMIT}
+                    }), 402
+
+        created = _create_access_user(
+            email=email,
+            username=username,
+            display_name=display_name,
+            password=password,
+            role=requested_role,
+            organization_id=organization_id,
+            organization_name=organization_name,
+        )
+        if not created:
+            return jsonify({"status": "error", "message": "Failed to create member"}), 500
+
+        _send_member_account_event(
+            created,
+            'created',
+            actor_name=actor.get('display_name') or actor.get('email'),
+            is_active=created.get('is_active', True),
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": "Member created",
+            "data": {
+                "member": {
+                    "id": created.get('id'),
+                    "email": created.get('email'),
+                    "username": created.get('username'),
+                    "display_name": created.get('display_name'),
+                    "role": created.get('role'),
+                    "organization_id": created.get('organization_id'),
+                    "organization_name": created.get('organization_name'),
+                    "is_active": created.get('is_active', True),
+                }
+            }
+        })
+    except Exception as e:
+        logger.exception('auth_create_member error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/billing/status', methods=['GET'])
+def billing_status():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        organization = _fetch_organization(actor.get('organization_id'))
+        if not organization:
+            return jsonify({"status": "error", "message": "Organization not found"}), 404
+
+        return jsonify({
+            "status": "success",
+            "data": {"billing": _organization_billing_payload(organization)}
+        })
+    except Exception as e:
+        logger.exception('billing_status error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/billing/create-checkout-session', methods=['POST'])
+def billing_create_checkout_session():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'owner':
+            return jsonify({"status": "error", "message": "Only organization owners can upgrade"}), 403
+
+        organization_id = actor.get('organization_id')
+        organization = _fetch_organization(organization_id)
+        if not organization:
+            return jsonify({"status": "error", "message": "Organization not found"}), 404
+
+        if _organization_is_upgraded(organization):
+            return jsonify({
+                "status": "success",
+                "message": "Organization is already upgraded",
+                "data": {"already_upgraded": True, "billing": _organization_billing_payload(organization)}
+            })
+
+        if stripe is None:
+            return jsonify({"status": "error", "message": "Stripe package is not installed"}), 500
+        if not STRIPE_SECRET_KEY or not STRIPE_UPGRADE_PRICE_ID:
+            return jsonify({"status": "error", "message": "Stripe is not configured. Set STRIPE_SECRET_KEY and STRIPE_UPGRADE_PRICE_ID."}), 500
+
+        checkout_session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{"price": STRIPE_UPGRADE_PRICE_ID, "quantity": 1}],
+            customer_email=actor.get('email'),
+            client_reference_id=str(organization_id),
+            metadata={
+                "organization_id": str(organization_id),
+                "owner_email": str(actor.get('email') or ''),
+            },
+            subscription_data={
+                "metadata": {
+                    "organization_id": str(organization_id),
+                    "owner_email": str(actor.get('email') or ''),
+                }
+            },
+            success_url=f"{FRONTEND_BASE_URL}/dashboard?upgrade=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_BASE_URL}/dashboard?upgrade=cancelled",
+        )
+
+        return jsonify({
+            "status": "success",
+            "data": {"checkout_url": checkout_session.url}
+        })
+    except Exception as e:
+        logger.exception('billing_create_checkout_session error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/billing/checkout/confirm', methods=['POST'])
+def billing_confirm_checkout():
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        if actor_role != 'owner':
+            return jsonify({"status": "error", "message": "Only organization owners can confirm upgrades"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        session_id = str(payload.get('session_id') or '').strip()
+        if not session_id:
+            return jsonify({"status": "error", "message": "session_id is required"}), 400
+
+        if stripe is None or not STRIPE_SECRET_KEY:
+            return jsonify({"status": "error", "message": "Stripe is not configured"}), 500
+
+        checkout_session = stripe.checkout.Session.retrieve(session_id)
+        session_org_id = str((checkout_session.metadata or {}).get('organization_id') or checkout_session.client_reference_id or '')
+        actor_org_id = str(actor.get('organization_id') or '')
+
+        if session_org_id != actor_org_id:
+            return jsonify({"status": "error", "message": "Checkout session does not belong to this organization"}), 403
+
+        if checkout_session.payment_status != 'paid' and checkout_session.status != 'complete':
+            return jsonify({"status": "error", "message": "Payment is not complete yet"}), 409
+
+        _mark_organization_upgraded(
+            actor_org_id,
+            stripe_customer_id=getattr(checkout_session, 'customer', None),
+            stripe_checkout_session_id=checkout_session.id,
+        )
+        organization = _fetch_organization(actor_org_id)
+
+        return jsonify({
+            "status": "success",
+            "message": "Organization upgraded",
+            "data": {"billing": _organization_billing_payload(organization)}
+        })
+    except Exception as e:
+        logger.exception('billing_confirm_checkout error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/billing/webhook', methods=['POST'])
+def billing_webhook():
+    try:
+        if stripe is None or not STRIPE_WEBHOOK_SECRET:
+            return jsonify({"status": "error", "message": "Stripe webhook is not configured"}), 500
+
+        payload = request.get_data()
+        signature = request.headers.get('Stripe-Signature', '')
+
+        try:
+            event = stripe.Webhook.construct_event(payload, signature, STRIPE_WEBHOOK_SECRET)
+        except Exception as e:
+            logger.warning('Invalid Stripe webhook: %s', e)
+            return jsonify({"status": "error", "message": "Invalid webhook"}), 400
+
+        event_type = _stripe_value(event, 'type')
+        if event_type == 'checkout.session.completed':
+            event_data = _stripe_value(event, 'data', {})
+            checkout_session = _stripe_value(event_data, 'object')
+            metadata = _stripe_value(checkout_session, 'metadata', {}) or {}
+            organization_id = str(
+                _stripe_value(metadata, 'organization_id', '')
+                or _stripe_value(checkout_session, 'client_reference_id', '')
+                or ''
+            )
+            if organization_id:
+                upgraded = _mark_organization_upgraded(
+                    organization_id,
+                    stripe_customer_id=_stripe_value(checkout_session, 'customer'),
+                    stripe_checkout_session_id=_stripe_value(checkout_session, 'id'),
+                )
+                if not upgraded:
+                    logger.warning('Stripe webhook could not mark organization %s upgraded', organization_id)
+
+        return jsonify({"status": "success"})
+    except Exception:
+        logger.exception('billing_webhook error')
+        return jsonify({"status": "error", "message": "Webhook processing failed"}), 500
+
+
+@app.route('/auth/members/<member_id>', methods=['DELETE'])
+def auth_delete_member(member_id):
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        actor_org_id = actor.get('organization_id')
+
+        # Only admins and owners can delete members
+        if actor_role not in ('admin', 'owner'):
+            return jsonify({"status": "error", "message": "Only admin or owner can delete members"}), 403
+
+        # Get Supabase client
+        client = _get_supabase_client()
+        if not client:
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+
+        # Fetch the member to verify they exist and belong to the right org
+        result = client.table('access_users').select('*').eq('id', member_id).execute()
+        if not result.data or len(result.data) == 0:
+            return jsonify({"status": "error", "message": "Member not found"}), 404
+
+        member = result.data[0]
+        member_org_id = member.get('organization_id')
+        member_role = str(member.get('role') or '').strip().lower()
+
+        # Owner can only delete members in their org
+        if actor_role == 'owner' and actor_org_id != member_org_id:
+            return jsonify({"status": "error", "message": "Cannot delete member from different organization"}), 403
+
+        # Owner should not be able to delete themselves
+        if actor_role == 'owner' and member.get('email') == actor.get('email'):
+            return jsonify({"status": "error", "message": "Owner cannot delete their own account"}), 403
+
+        # If an admin removes an owner, pause the whole organization and every account in it.
+        if actor_role == 'admin' and member_role == 'owner' and member_org_id:
+            client.table(SUPABASE_ORGANIZATIONS_TABLE).update({'is_active': False}).eq('id', member_org_id).execute()
+            client.table(SUPABASE_ACCESS_USERS_TABLE).update({'is_active': False}).eq('organization_id', member_org_id).execute()
+            logger.info(f"Organization {member_org_id} deactivated because owner {member_id} was removed by {actor.get('email')}")
+            return jsonify({
+                "status": "success",
+                "message": "Organization owner deactivated and organization access revoked"
+            })
+
+        # Delete the member
+        _send_member_account_event(
+            member,
+            'deleted',
+            actor_name=actor.get('display_name') or actor.get('email'),
+            is_active=False,
+        )
+        client.table('access_users').delete().eq('id', member_id).execute()
+        logger.info(f"Member {member_id} deleted by {actor.get('email')}")
+
+        return jsonify({
+            "status": "success",
+            "message": "Member deleted successfully"
+        })
+    except Exception as e:
+        logger.exception('auth_delete_member error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/auth/members/<member_id>/status', methods=['PATCH'])
+def auth_update_member_status(member_id):
+    try:
+        actor = _request_actor_user()
+        if not actor:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        actor_role = str(actor.get('role') or '').strip().lower()
+        actor_org_id = actor.get('organization_id')
+        actor_email = str(actor.get('email') or '').strip().lower()
+
+        if actor_role not in ('admin', 'owner'):
+            return jsonify({"status": "error", "message": "Only admin or owner can update member status"}), 403
+
+        payload = request.get_json(silent=True) or {}
+        if 'is_active' not in payload:
+            return jsonify({"status": "error", "message": "is_active is required"}), 400
+
+        is_active = bool(payload.get('is_active'))
+
+        client = _get_supabase_client()
+        if not client:
+            return jsonify({"status": "error", "message": "Database unavailable"}), 500
+
+        result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('id', member_id).limit(1).execute()
+        if not result.data:
+            return jsonify({"status": "error", "message": "Member not found"}), 404
+
+        member = result.data[0]
+        member_org_id = member.get('organization_id')
+        member_role = str(member.get('role') or '').strip().lower()
+        member_email = str(member.get('email') or '').strip().lower()
+
+        if actor_role == 'owner' and actor_org_id != member_org_id:
+            return jsonify({"status": "error", "message": "Cannot update status for a different organization"}), 403
+
+        if actor_role == 'owner' and member_email == actor_email:
+            return jsonify({"status": "error", "message": "Owner cannot change their own account status"}), 403
+
+        # Admin pausing/resuming an owner controls the entire organization.
+        if actor_role == 'admin' and member_role == 'owner' and member_org_id:
+            client.table(SUPABASE_ORGANIZATIONS_TABLE).update({'is_active': is_active}).eq('id', member_org_id).execute()
+            client.table(SUPABASE_ACCESS_USERS_TABLE).update({'is_active': is_active}).eq('organization_id', member_org_id).execute()
+            action = 'resumed' if is_active else 'paused'
+            logger.info(f"Organization {member_org_id} {action} because owner status changed by {actor.get('email')}")
+            return jsonify({
+                "status": "success",
+                "message": f"Organization access {action} successfully"
+            })
+
+        client.table(SUPABASE_ACCESS_USERS_TABLE).update({'is_active': is_active}).eq('id', member_id).execute()
+        _send_member_account_event(
+            {**member, 'is_active': is_active},
+            'status_changed',
+            actor_name=actor.get('display_name') or actor.get('email'),
+            is_active=is_active,
+        )
+        state_text = 'activated' if is_active else 'deactivated'
+        return jsonify({
+            "status": "success",
+            "message": f"Member {state_text} successfully"
+        })
+    except Exception as e:
+        logger.exception('auth_update_member_status error')
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route('/dashboard-overview', methods=['GET'])
 def dashboard_overview():
     try:
-        residents      = []
-        residents_dir  = UPLOAD_FOLDER
-        total_images   = 0
-        total_faces    = 0
-        active_res     = 0
-        today_prefix   = datetime.now(timezone.utc).date().isoformat()
+        company_id = _get_request_company_id()
+        company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+        today_prefix = datetime.now(timezone.utc).date().isoformat()
+
+        # Org-scoped overview comes from Supabase only; local filesystem fallback is disabled.
+        residents = []
+        total_images = 0
+        total_faces = 0
+        active_res = 0
         enrollments_today = 0
 
-        for folder_name in os.listdir(residents_dir):
-            folder_path  = os.path.join(residents_dir, folder_name)
-            if not os.path.isdir(folder_path) or folder_name.startswith('temp'):
-                continue
-            profile_path = os.path.join(folder_path, 'profile_data.json')
-            if not os.path.exists(profile_path):
-                continue
+        if company_id:
             try:
-                with open(profile_path, 'r') as f:
-                    pd = json.load(f)
-                residents.append(pd)
-                total_images += int(pd.get('image_count', 0))
-                total_faces  += int(pd.get('faces_detected', 0))
-                if pd.get('status', 'Active') == 'Active':
-                    active_res += 1
-                if str(pd.get('enrolled_at', '')).startswith(today_prefix):
-                    enrollments_today += 1
+                client = _get_supabase_client()
+                if client is not None:
+                    try:
+                        residents_result = (
+                            client.table(SUPABASE_RESIDENTS_TABLE)
+                            .select('*')
+                            .eq('organization_id', company_id)
+                            .order('enrolled_at', desc=True)
+                            .execute()
+                        )
+                        residents = residents_result.data or []
+                    except Exception:
+                        if company_name:
+                            logger.warning("Falling back to organization_name for resident overview scope")
+                            residents_result = (
+                                client.table(SUPABASE_RESIDENTS_TABLE)
+                                .select('*')
+                                .eq('organization_name', company_name)
+                                .order('enrolled_at', desc=True)
+                                .execute()
+                            )
+                            residents = residents_result.data or []
+                    for resident in residents:
+                        total_images += int(resident.get('image_count', 0) or 0)
+                        total_faces += int(resident.get('faces_detected', 0) or 0)
+                        if str(resident.get('status', 'Active')) == 'Active':
+                            active_res += 1
+                        if str(resident.get('enrolled_at', '')).startswith(today_prefix):
+                            enrollments_today += 1
             except Exception:
-                pass
+                logger.exception("dashboard_overview resident fetch error")
 
-        face_logs_data   = read_face_logs()
-        helmet_logs_data = read_helmet_logs()
-        mask_logs_data   = read_mask_logs()
+        face_logs_data = read_face_logs(company_id=company_id, company_name=company_name)
+        helmet_logs_data = read_helmet_logs(company_id=company_id, company_name=company_name)
+        mask_logs_data = read_mask_logs(company_id=company_id, company_name=company_name)
 
         helmet_today = sum(1 for l in helmet_logs_data if str(l.get('timestamp', '')).startswith(today_prefix))
         mask_today   = sum(1 for l in mask_logs_data   if str(l.get('timestamp', '')).startswith(today_prefix))
@@ -1151,6 +2401,10 @@ register_face_routes(app, {
     "_delete_storage_paths_from_supabase": _delete_storage_paths_from_supabase,
     "_update_resident_supabase": _update_resident_supabase,
     "_upload_local_file_to_supabase_storage": _upload_local_file_to_supabase_storage,
+    "_check_enrollment_permission": _check_enrollment_permission,
+    "_check_directory_permission": _check_directory_permission,
+    "_check_capture_permission": _check_capture_permission,
+    "_check_delete_permission": _check_delete_permission,
 })
 
 register_helmet_routes(app, {
@@ -1162,6 +2416,7 @@ register_helmet_routes(app, {
     "_persist_detection_image": _persist_detection_image,
     "_attach_storage_result_to_log": _attach_storage_result_to_log,
     "_should_store_stream_event": _should_store_stream_event,
+    "_check_capture_permission": _check_capture_permission,
 })
 
 register_mask_routes(app, {
@@ -1174,15 +2429,22 @@ register_mask_routes(app, {
     "_persist_detection_image": _persist_detection_image,
     "_attach_storage_result_to_log": _attach_storage_result_to_log,
     "_should_store_stream_event": _should_store_stream_event,
+    "_check_capture_permission": _check_capture_permission,
+})
+
+register_email_service(app, {
+    "logger": logger,
+    "_get_supabase_client": _get_supabase_client,
+    "_fetch_organization_name": _fetch_organization_name,
+    "_read_all_residents_supabase": _read_all_residents_supabase,
+    "_read_face_logs": read_face_logs,
+    "_read_helmet_logs": read_helmet_logs,
+    "_read_mask_logs": read_mask_logs,
 })
 
 
 # ==============================================================================
 # STARTUP: EAGER MODEL WARM-UP
-# KEY FIX: Block until models are loaded BEFORE Flask accepts any requests.
-# The original code used a daemon thread, meaning the first HTTP request
-# could arrive before models finished loading — causing a 20–30s cold-load
-# during the very first inference call.
 # ==============================================================================
 
 def _eager_load_blocking():
@@ -1251,8 +2513,8 @@ def debug_supabase_status():
         "SUPABASE_ENABLED_VALUE": SUPABASE_ENABLED,
         "create_client_imported": create_client is not None,
         "model_status": {
-            "helmet_loaded":    HELMET_MODEL is not None,
-            "mask_loaded":      MASK_MODEL is not None,
+            "helmet_loaded":      HELMET_MODEL is not None,
+            "mask_loaded":        MASK_MODEL is not None,
             "insightface_loaded": INSIGHT_APP is not None,
         }
     })
@@ -1281,7 +2543,5 @@ if __name__ == '__main__':
         _eager_load_blocking()
         sys.exit(0)
 
-    # Load all models BEFORE starting the server so no request ever cold-loads
     _eager_load_blocking()
-
     app.run(debug=False, host='0.0.0.0', port=5000)

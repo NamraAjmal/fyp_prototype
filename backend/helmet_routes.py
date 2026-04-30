@@ -17,13 +17,21 @@ def register_helmet_routes(app, deps):
     _persist_detection_image = deps["_persist_detection_image"]
     _attach_storage_result_to_log = deps["_attach_storage_result_to_log"]
     _should_store_stream_event = deps["_should_store_stream_event"]
+    _check_capture_permission = deps["_check_capture_permission"]
 
     @app.route('/helmet-detect', methods=['POST'])
     def helmet_detect():
+        is_allowed, error_info = _check_capture_permission()
+        if not is_allowed:
+            error_msg, status_code = error_info
+            return jsonify({"status": "error", "message": error_msg}), status_code
+
         image = request.files.get('image')
         location = request.form.get('location', 'Unknown Site')
         source = request.form.get('source', 'image')
         camera_id = request.form.get('camera_id', '')
+        company_id = (request.form.get('company_id') or request.headers.get('X-Company-ID') or '').strip() or None
+        company_name = (request.form.get('company_name') or request.headers.get('X-Company-Name') or '').strip() or None
 
         if image is None or not image.filename:
             return jsonify({"status": "error", "message": "image is required"}), 400
@@ -50,6 +58,8 @@ def register_helmet_routes(app, deps):
                 "file_name": image.filename,
                 "source": source,
                 "camera_id": camera_id,
+                "company_id": company_id,
+                "organization_name": company_name,
                 "processing_ms": round(processing_ms, 2),
                 "annotated_image": detection["annotated_image"],
             }
@@ -73,12 +83,19 @@ def register_helmet_routes(app, deps):
 
     @app.route('/helmet-detect-stream', methods=['POST'])
     def helmet_detect_stream():
+        is_allowed, error_info = _check_capture_permission()
+        if not is_allowed:
+            error_msg, status_code = error_info
+            return jsonify({"status": "error", "message": error_msg}), status_code
+
         data = request.get_json()
         if not data or 'frame' not in data:
             return jsonify({"status": "error", "message": "frame is required"}), 400
 
         location = data.get('location', 'Unknown Site')
         camera_id = data.get('camera_id', 'cam_01')
+        company_id = (request.headers.get('X-Company-ID') or data.get('company_id') or '').strip() or None
+        company_name = (request.headers.get('X-Company-Name') or data.get('company_name') or '').strip() or None
         temp_path = None
 
         try:
@@ -117,6 +134,8 @@ def register_helmet_routes(app, deps):
                     "file_name": f"stream_{camera_id}",
                     "source": "stream",
                     "camera_id": camera_id,
+                    "company_id": company_id,
+                    "organization_name": company_name,
                     "processing_ms": round(processing_ms, 2),
                     "annotated_image": detection["annotated_image"],
                 }
@@ -136,7 +155,9 @@ def register_helmet_routes(app, deps):
     @app.route('/helmet-logs', methods=['GET'])
     def helmet_logs():
         try:
-            logs = read_helmet_logs()
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+            logs = read_helmet_logs(company_id=company_id, company_name=company_name)
             location = request.args.get('location', 'all')
             status = request.args.get('status', 'all')
             source = request.args.get('source', 'all')

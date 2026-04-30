@@ -2,8 +2,12 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { Camera, BarChart3, ArrowRight } from "lucide-react";
 import { fetchMaskSummary, type MaskSummary } from "../../services/maskApi";
+import { getAuthSession } from "../../services/authSession";
 
 function MaskDetectionPage() {
+  const session = getAuthSession();
+  const role = (session?.role || "").toLowerCase();
+  const isViewer = role === "viewer";
   const [summary, setSummary] = useState<MaskSummary>({
     total_detections: 0,
     compliant: 0,
@@ -41,7 +45,7 @@ function MaskDetectionPage() {
       path: "/dashboard/mask-detection/logs",
       color: "from-purple-500 to-blue-500",
     },
-  ];
+  ].filter((feature) => !isViewer || feature.title === "Logs & Analytics");
 
   return (
     <div className="space-y-8">

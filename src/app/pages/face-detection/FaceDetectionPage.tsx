@@ -5,6 +5,7 @@ import {
   fetchDashboardOverview,
   type DashboardOverview,
 } from "../../services/dashboardApi";
+import { getAuthSession } from "../../services/authSession";
 
 const initialOverview: DashboardOverview = {
   residentsTotal: 0,
@@ -22,6 +23,9 @@ const initialOverview: DashboardOverview = {
 };
 
 function FaceDetectionPage() {
+  const session = getAuthSession();
+  const role = (session?.role || "").toLowerCase();
+  const isViewer = role === "viewer";
   const [overview, setOverview] = useState<DashboardOverview>(initialOverview);
   const [loading, setLoading] = useState(true);
 
@@ -80,7 +84,7 @@ function FaceDetectionPage() {
       path: "/dashboard/face-detection/logs",
       color: "from-orange-500 to-red-500",
     },
-  ];
+  ].filter((feature) => !isViewer || feature.title === "Logs & Analytics");
 
   return (
     <div className="space-y-8">
@@ -102,12 +106,12 @@ function FaceDetectionPage() {
             className="group relative bg-white rounded-xl p-6 shadow-md border border-slate-200/50 hover:shadow-xl transition-all duration-300 hover:scale-[1.02] overflow-hidden"
           >
             <div
-              className={`absolute inset-0 bg-gradient-to-br ${feature.color} opacity-0 group-hover:opacity-10 transition-opacity`}
+              className={`absolute inset-0 bg-linear-to-br ${feature.color} opacity-0 group-hover:opacity-10 transition-opacity`}
             ></div>
 
             <div className="relative z-10">
               <div
-                className={`inline-flex p-3 rounded-xl bg-gradient-to-br ${feature.color} mb-4 shadow-lg`}
+                className={`inline-flex p-3 rounded-xl bg-linear-to-br ${feature.color} mb-4 shadow-lg`}
               >
                 <feature.icon className="w-6 h-6 text-white" />
               </div>

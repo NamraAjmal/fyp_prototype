@@ -35,6 +35,8 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "../../components/ui/dropdown-menu";
+import { buildAuthHeaders } from "../../services/authSession";
+import { hasPremiumAccess } from "../../services/billingApi";
 
 const API_BASE = "http://127.0.0.1:5000";
 
@@ -218,6 +220,7 @@ function downloadFile(content: string, mimeType: string, fileName: string) {
 }
 
 function FaceLogsAnalyticsPage() {
+  const canExport = hasPremiumAccess();
   const [logs, setLogs] = useState<FaceLog[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loading, setLoading] = useState(true);
@@ -240,7 +243,9 @@ function FaceLogsAnalyticsPage() {
         ...(statusFilter !== "all" ? { status: statusFilter } : {}),
       });
 
-      const res = await fetch(`${API_BASE}/face-logs?${params}`);
+      const res = await fetch(`${API_BASE}/face-logs?${params}`, {
+        headers: buildAuthHeaders(),
+      });
       const result = await res.json();
 
       if (result.status === "success") {
@@ -263,6 +268,10 @@ function FaceLogsAnalyticsPage() {
 
   const handleExport = (format: ExportFormat) => {
     setError(null);
+    if (!canExport) {
+      setError("Exports are available after the organization upgrade.");
+      return;
+    }
 
     const rows = buildExportRows(logs);
 
@@ -396,7 +405,15 @@ function FaceLogsAnalyticsPage() {
           </button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-linear-to-r from-blue-500 to-cyan-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all">
+              <button
+                disabled={!canExport}
+                title={
+                  canExport
+                    ? "Export"
+                    : "Upgrade required to export reports"
+                }
+                className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-linear-to-r from-blue-500 to-cyan-500 text-white rounded-lg font-medium shadow-lg hover:shadow-xl transition-all disabled:cursor-not-allowed disabled:opacity-50"
+              >
                 <Download className="w-4 h-4" />
                 Export
                 <ChevronDown className="w-4 h-4" />

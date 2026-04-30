@@ -10,6 +10,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { Link } from "react-router";
+import { buildAuthHeaders } from "../../services/authSession";
 
 const API_BASE = "http://127.0.0.1:5000";
 
@@ -146,6 +147,7 @@ function FaceImageCapturePage() {
       try {
         const res = await fetch(`${API_BASE}/recognize-face`, {
           method: "POST",
+          headers: buildAuthHeaders(),
           body: formData,
         });
         const result = await res.json();
@@ -208,7 +210,10 @@ function FaceImageCapturePage() {
     try {
       const res = await fetch(`${API_BASE}/recognize-face-stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...buildAuthHeaders(),
+        },
         body: JSON.stringify({ frame }),
       });
       const result = await res.json();

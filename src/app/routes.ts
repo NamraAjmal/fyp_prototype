@@ -2,8 +2,9 @@ import { createBrowserRouter, Outlet } from "react-router";
 import AuthLayout from "./layouts/AuthLayout";
 import DashboardLayout from "./layouts/DashboardLayout";
 import LoginPage from "./pages/auth/LoginPage";
-import SignupPage from "./pages/auth/SignupPage";
 import HomePage from "./pages/HomePage";
+import AdminOrganizationsPage from "./pages/admin/AdminOrganizationsPage";
+import OrganizationManagementPage from "./pages/organization/OrganizationManagementPage";
 import FaceDetectionPage from "./pages/face-detection/FaceDetectionPage";
 import FaceImageCapturePage from "./pages/face-detection/FaceImageCapturePage";
 import FaceLogsAnalyticsPage from "./pages/face-detection/FaceLogsAnalyticsPage";
@@ -23,7 +24,6 @@ export const router = createBrowserRouter([
     children: [
       { index: true, Component: LoginPage },
       { path: "login", Component: LoginPage },
-      { path: "signup", Component: SignupPage },
     ],
   },
   {
@@ -31,6 +31,8 @@ export const router = createBrowserRouter([
     Component: DashboardLayout,
     children: [
       { index: true, Component: HomePage },
+      { path: "admin/organizations", Component: AdminOrganizationsPage },
+      { path: "organization/manage", Component: OrganizationManagementPage },
       { path: "face-detection", Component: FaceDetectionPage },
       { path: "face-detection/enrollment", Component: ResidentEnrollmentPage },
       { path: "face-detection/directory", Component: ResidentDirectoryPage },
