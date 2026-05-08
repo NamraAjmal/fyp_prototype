@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import threading
-from uuid import uuid4
+from uuid import uuid4, UUID
 import cv2
 from ultralytics import YOLO
 import torch
@@ -150,10 +150,13 @@ def _read_supabase_logs(table_name, limit=5000, company_id=None, company_name=No
             item = dict(row)
             item_company_id = str(item.get('company_id') or '').strip()
             item_company_name = str(item.get('organization_name') or '').strip()
-            if company_id and item_company_id:
+            # Strict tenancy: when company_id is provided, never fall back to
+            # organization_name matching. This prevents stale rows from a deleted
+            # org (same name, different id) from leaking into a recreated org.
+            if company_id:
                 if item_company_id != company_id:
                     continue
-            elif company_id and company_name:
+            elif company_name:
                 if item_company_name != company_name:
                     continue
             if 'id' not in item and 'local_id' in item:
@@ -295,25 +298,57 @@ def _verify_login_password(stored_hash, candidate_password):
     return raw == candidate_password
 
 
-def _fetch_access_user_by_identifier(identifier):
-    """Fetch a user ONLY by email, not username."""
+def _fetch_access_users_by_email(identifier, organization_id=None):
+    """Fetch users by email, optionally scoped to an organization."""
     client = _get_supabase_client()
     if client is None:
-        return None
+        logger.warning('Supabase client is None in _fetch_access_users_by_email')
+        return []
 
     ident = (identifier or '').strip().lower()
     if not ident:
+        logger.warning('Empty identifier passed to _fetch_access_users_by_email')
+        return []
+
+    scoped_org_id = None
+    if organization_id is not None:
+        candidate_org_id = str(organization_id).strip()
+        if candidate_org_id and candidate_org_id.lower() != 'global':
+            try:
+                scoped_org_id = str(UUID(candidate_org_id))
+            except ValueError:
+                logger.warning('Ignoring invalid organization_id scope for %s: %s', ident, candidate_org_id)
+
+    logger.debug(f'Fetching access users by email: {ident}')
+    try:
+        query = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', ident)
+        if scoped_org_id is not None:
+            query = query.eq('organization_id', scoped_org_id)
+
+        by_email = query.limit(2).execute()
+        if by_email.data:
+            logger.debug(f'Found {len(by_email.data)} user(s) for email: {ident}')
+            return by_email.data
+        logger.warning(f'No user found for email: {ident}')
+    except Exception as e:
+        logger.exception(f'Failed to read access user by email {ident}: {str(e)}')
+
+    return []
+
+
+def _fetch_access_user_by_identifier(identifier, organization_id=None):
+    """Fetch a user by email, optionally scoped to an organization."""
+    users = _fetch_access_users_by_email(identifier, organization_id=organization_id)
+    if not users:
         return None
 
-    # ONLY check by email
-    try:
-        by_email = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', ident).limit(1).execute()
-        if by_email.data:
-            return by_email.data[0]
-    except Exception:
-        logger.exception('Failed to read access user by email')
+    if len(users) > 1 and organization_id is None:
+        logger.warning(
+            "Multiple access users found for email %s without organization scope; using the first match",
+            (identifier or '').strip().lower(),
+        )
 
-    return None
+    return users[0]
 
 
 def _fetch_organization_name(organization_id):
@@ -330,6 +365,24 @@ def _fetch_organization_name(organization_id):
             return response.data[0].get('name')
     except Exception:
         logger.exception('Failed to read organization name')
+
+    return None
+
+
+def _fetch_organization_by_code(code):
+    if not code:
+        return None
+
+    client = _get_supabase_client()
+    if client is None:
+        return None
+
+    try:
+        response = client.table(SUPABASE_ORGANIZATIONS_TABLE).select('*').eq('code', code).limit(1).execute()
+        if response.data:
+            return response.data[0]
+    except Exception:
+        logger.exception('Failed to read organization by code')
 
     return None
 
@@ -571,7 +624,10 @@ def _create_access_user(*, email, username, display_name, password, role, organi
             logger.error(f"Insert succeeded but no data returned for user '{clean_email}'")
             # Try to fetch the newly created user
             try:
-                fetch_result = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', clean_email).limit(1).execute()
+                query = client.table(SUPABASE_ACCESS_USERS_TABLE).select('*').eq('email', clean_email)
+                if organization_id is not None:
+                    query = query.eq('organization_id', organization_id)
+                fetch_result = query.limit(1).execute()
                 if fetch_result.data:
                     return fetch_result.data[0]
             except:
@@ -585,7 +641,15 @@ def _request_actor_user():
     actor_email = (request.headers.get('X-User-Email') or '').strip().lower()
     if not actor_email:
         return None
-    return _fetch_access_user_by_identifier(actor_email)
+
+    actor_org_id_raw = (request.headers.get('X-Company-ID') or '').strip()
+    actor_org_id = None
+    if actor_org_id_raw and actor_org_id_raw.lower() != 'global':
+        try:
+            actor_org_id = str(UUID(actor_org_id_raw))
+        except ValueError:
+            logger.warning('Ignoring invalid X-Company-ID header for actor %s: %s', actor_email, actor_org_id_raw)
+    return _fetch_access_user_by_identifier(actor_email, organization_id=actor_org_id)
 
 
 def _check_enrollment_permission():
@@ -688,23 +752,33 @@ def _insert_resident_supabase(resident_data):
         return None
 
 
-def _update_resident_supabase(cnic, updates):
+def _update_resident_supabase(cnic, updates, company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return
     try:
-        client.table(SUPABASE_RESIDENTS_TABLE).update(updates).eq('cnic', cnic).execute()
+        query = client.table(SUPABASE_RESIDENTS_TABLE).update(updates).eq('cnic', cnic)
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+        query.execute()
         logger.info(f"Resident {cnic} updated in Supabase")
     except Exception:
         logger.exception(f"Supabase update failed for resident {cnic}")
 
 
-def _delete_resident_supabase(cnic):
+def _delete_resident_supabase(cnic, company_id=None, company_name=None):
     client = _get_supabase_client()
     if client is None:
         return
     try:
-        client.table(SUPABASE_RESIDENTS_TABLE).delete().eq('cnic', cnic).execute()
+        query = client.table(SUPABASE_RESIDENTS_TABLE).delete().eq('cnic', cnic)
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+        query.execute()
         logger.info(f"Resident {cnic} deleted from Supabase")
     except Exception:
         logger.exception(f"Supabase delete failed for resident {cnic}")
@@ -727,10 +801,13 @@ def _read_resident_supabase(cnic, company_id=None, company_name=None):
     if client is None:
         return None
     try:
-        response = client.table(SUPABASE_RESIDENTS_TABLE).select('*').eq('cnic', cnic).single().execute()
-        resident = response.data if response.data else None
-        if resident is not None and not _resident_matches_scope(resident, company_id=company_id, company_name=company_name):
-            return None
+        query = client.table(SUPABASE_RESIDENTS_TABLE).select('*').eq('cnic', cnic)
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+        response = query.limit(1).execute()
+        resident = response.data[0] if response.data else None
         return resident
     except Exception:
         logger.exception(f"Supabase read failed for resident {cnic}")
@@ -770,11 +847,26 @@ def _insert_resident_images_supabase(cnic, images_list):
                 "file_size": img_info.get("file_size"),
                 "storage_path": img_info.get("storage_path"),
                 "public_url": img_info.get("public_url"),
+                "organization_id": img_info.get("organization_id"),
+                "organization_name": img_info.get("organization_name"),
             }
             for img_info in images_list
         ]
         if payloads:
-            client.table(SUPABASE_RESIDENT_IMAGES_TABLE).insert(payloads).execute()
+            try:
+                client.table(SUPABASE_RESIDENT_IMAGES_TABLE).insert(payloads).execute()
+            except Exception as first_err:
+                error_text = str(first_err).lower()
+                if 'organization_id' in error_text or 'organization_name' in error_text or 'column' in error_text:
+                    fallback_payloads = []
+                    for payload in payloads:
+                        fallback = dict(payload)
+                        fallback.pop('organization_id', None)
+                        fallback.pop('organization_name', None)
+                        fallback_payloads.append(fallback)
+                    client.table(SUPABASE_RESIDENT_IMAGES_TABLE).insert(fallback_payloads).execute()
+                else:
+                    raise
             logger.info(f"Inserted {len(payloads)} images for resident {cnic}")
     except Exception:
         logger.exception(f"Supabase insert images failed for resident {cnic}")
@@ -789,13 +881,31 @@ def _read_resident_images_supabase(cnic, company_id=None, company_name=None):
             resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
             if resident is None:
                 return []
-        response = (
+        query = (
             client.table(SUPABASE_RESIDENT_IMAGES_TABLE)
             .select('filename,storage_path,public_url')
             .eq('cnic', cnic)
             .order('created_at', desc=False)
-            .execute()
         )
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+
+        try:
+            response = query.execute()
+        except Exception as first_err:
+            error_text = str(first_err).lower()
+            if (company_id or company_name) and ('organization_id' in error_text or 'organization_name' in error_text or 'column' in error_text):
+                response = (
+                    client.table(SUPABASE_RESIDENT_IMAGES_TABLE)
+                    .select('filename,storage_path,public_url')
+                    .eq('cnic', cnic)
+                    .order('created_at', desc=False)
+                    .execute()
+                )
+            else:
+                raise
         return response.data or []
     except Exception:
         logger.exception(f"Supabase read failed for resident images {cnic}")
@@ -1564,13 +1674,32 @@ def auth_login():
     try:
         payload = request.get_json(silent=True) or {}
         identifier = (payload.get('identifier') or payload.get('email') or '').strip()
+        organization_code = (payload.get('organization_code') or '').strip()
         password = str(payload.get('password') or '')
 
+        logger.debug(f'Login attempt for: {identifier}')
         if not identifier or not password:
+            logger.warning(f'Login attempt missing identifier or password')
             return jsonify({"status": "error", "message": "Identifier and password are required"}), 400
 
-        user = _fetch_access_user_by_identifier(identifier)
+        if organization_code:
+            organization = _fetch_organization_by_code(organization_code)
+            if not organization:
+                return jsonify({"status": "error", "message": "Organization code not found"}), 404
+
+            user = _fetch_access_user_by_identifier(identifier, organization_id=organization.get('id'))
+        else:
+            users = _fetch_access_users_by_email(identifier)
+            if len(users) > 1:
+                return jsonify({
+                    "status": "error",
+                    "message": "Multiple accounts use this email. Please enter your organization code to continue.",
+                    "code": "organization_required",
+                }), 409
+            user = users[0] if users else None
+
         if not user:
+            logger.warning(f'User not found or Supabase error: {identifier}')
             return jsonify({"status": "error", "message": "Invalid credentials"}), 401
 
         if user.get('is_active') is False:
@@ -1818,14 +1947,6 @@ def auth_create_organization_owner():
         if not organization_name or not email or not password:
             return jsonify({"status": "error", "message": "organization_name, email and password are required"}), 400
 
-        # ONLY check email - not username
-        existing_user = _fetch_access_user_by_identifier(email)
-        if existing_user is not None:
-            return jsonify({
-                "status": "error", 
-                "message": "An account with this email already exists. Please use a different email."
-            }), 409
-
         # Create the organization first
         logger.info(f"Creating organization '{organization_name}'...")
         org = _resolve_or_create_organization(organization_name, organization_code, owner_email=email)
@@ -1925,10 +2046,6 @@ def auth_create_member():
         if actor_role == 'owner' and requested_role in ('owner', 'admin'):
             return jsonify({"status": "error", "message": "Owner can add manager/operator/viewer only"}), 403
 
-        # ONLY check email - not username
-        if _fetch_access_user_by_identifier(email) is not None:
-            return jsonify({"status": "error", "message": "An account with this email already exists"}), 409
-
         actor_org_id = actor.get('organization_id')
         actor_org_name = actor.get('organization_name') or _fetch_organization_name(actor_org_id)
 
@@ -1949,6 +2066,9 @@ def auth_create_member():
                         "code": "upgrade_required",
                         "data": {"member_limit": FREE_ORG_MEMBER_LIMIT}
                     }), 402
+
+        if _fetch_access_user_by_identifier(email, organization_id=organization_id) is not None:
+            return jsonify({"status": "error", "message": "An account with this email already exists in this organization"}), 409
 
         created = _create_access_user(
             email=email,
@@ -2013,6 +2133,16 @@ def billing_status():
 @app.route('/billing/create-checkout-session', methods=['POST'])
 def billing_create_checkout_session():
     try:
+        payload = request.get_json(silent=True) or {}
+        requested_origin = (payload.get('origin') or '').strip()
+        # Normalize/validate origin
+        if requested_origin and (requested_origin.startswith('http://') or requested_origin.startswith('https://')):
+            frontend_origin = requested_origin.rstrip('/')
+        else:
+            frontend_origin = FRONTEND_BASE_URL
+
+        logger.info(f'Using frontend origin for checkout: {frontend_origin}')
+
         actor = _request_actor_user()
         if not actor:
             return jsonify({"status": "error", "message": "Unauthorized"}), 401
@@ -2054,13 +2184,14 @@ def billing_create_checkout_session():
                     "owner_email": str(actor.get('email') or ''),
                 }
             },
-            success_url=f"{FRONTEND_BASE_URL}/dashboard?upgrade=success&session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_BASE_URL}/dashboard?upgrade=cancelled",
+            success_url=f"{frontend_origin}/dashboard?upgrade=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{frontend_origin}/dashboard?upgrade=cancelled",
         )
 
+        logger.info(f'Checkout session created: id={getattr(checkout_session, "id", None)} url={getattr(checkout_session, "url", None)}')
         return jsonify({
             "status": "success",
-            "data": {"checkout_url": checkout_session.url}
+            "data": {"checkout_url": checkout_session.url, "checkout_id": getattr(checkout_session, 'id', None)}
         })
     except Exception as e:
         logger.exception('billing_create_checkout_session error')
@@ -2080,6 +2211,7 @@ def billing_confirm_checkout():
 
         payload = request.get_json(silent=True) or {}
         session_id = str(payload.get('session_id') or '').strip()
+        logger.info(f'billing_confirm_checkout called by actor={actor.get("email")}, session_id={session_id}')
         if not session_id:
             return jsonify({"status": "error", "message": "session_id is required"}), 400
 
@@ -2087,7 +2219,9 @@ def billing_confirm_checkout():
             return jsonify({"status": "error", "message": "Stripe is not configured"}), 500
 
         checkout_session = stripe.checkout.Session.retrieve(session_id)
-        session_org_id = str((checkout_session.metadata or {}).get('organization_id') or checkout_session.client_reference_id or '')
+        # Convert Stripe metadata object to dict for safe .get() access
+        metadata_dict = dict(checkout_session.metadata) if checkout_session.metadata else {}
+        session_org_id = str(metadata_dict.get('organization_id') or checkout_session.client_reference_id or '')
         actor_org_id = str(actor.get('organization_id') or '')
 
         if session_org_id != actor_org_id:
@@ -2096,12 +2230,25 @@ def billing_confirm_checkout():
         if checkout_session.payment_status != 'paid' and checkout_session.status != 'complete':
             return jsonify({"status": "error", "message": "Payment is not complete yet"}), 409
 
-        _mark_organization_upgraded(
+        upgraded = _mark_organization_upgraded(
             actor_org_id,
             stripe_customer_id=getattr(checkout_session, 'customer', None),
             stripe_checkout_session_id=checkout_session.id,
         )
-        organization = _fetch_organization(actor_org_id)
+        logger.info(f'Organization upgrade marked: org_id={actor_org_id}, success={upgraded}')
+        
+        # Fetch updated organization; if network fails, still return success since upgrade was marked
+        organization = None
+        try:
+            organization = _fetch_organization(actor_org_id)
+        except Exception as e:
+            logger.warning(f'Failed to fetch updated organization after upgrade: {str(e)}')
+            # Return success anyway since the upgrade was marked in the database
+            return jsonify({
+                "status": "success",
+                "message": "Organization upgraded (fetch failed but upgrade marked)",
+                "data": {"billing": {"plan": "premium", "is_upgraded": True}}
+            })
 
         return jsonify({
             "status": "success",
@@ -2303,26 +2450,14 @@ def dashboard_overview():
             try:
                 client = _get_supabase_client()
                 if client is not None:
-                    try:
-                        residents_result = (
-                            client.table(SUPABASE_RESIDENTS_TABLE)
-                            .select('*')
-                            .eq('organization_id', company_id)
-                            .order('enrolled_at', desc=True)
-                            .execute()
-                        )
-                        residents = residents_result.data or []
-                    except Exception:
-                        if company_name:
-                            logger.warning("Falling back to organization_name for resident overview scope")
-                            residents_result = (
-                                client.table(SUPABASE_RESIDENTS_TABLE)
-                                .select('*')
-                                .eq('organization_name', company_name)
-                                .order('enrolled_at', desc=True)
-                                .execute()
-                            )
-                            residents = residents_result.data or []
+                    residents_result = (
+                        client.table(SUPABASE_RESIDENTS_TABLE)
+                        .select('*')
+                        .eq('organization_id', company_id)
+                        .order('enrolled_at', desc=True)
+                        .execute()
+                    )
+                    residents = residents_result.data or []
                     for resident in residents:
                         total_images += int(resident.get('image_count', 0) or 0)
                         total_faces += int(resident.get('faces_detected', 0) or 0)

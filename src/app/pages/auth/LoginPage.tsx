@@ -19,6 +19,7 @@ function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [loginForm, setLoginForm] = useState({
     identifier: "",
+    organizationCode: "",
     password: "",
   });
 
@@ -35,6 +36,7 @@ function LoginPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           identifier: loginForm.identifier.trim(),
+          organization_code: loginForm.organizationCode.trim(),
           password: loginForm.password,
         }),
       });
@@ -53,7 +55,7 @@ function LoginPage() {
       }
 
       const role = String(user.role).toLowerCase();
-      const organizationId = String(user.organization_id || "global");
+      const organizationId = String(user.organization_id || "");
       const billing = user.billing || {};
       const destination = "/dashboard";
 
@@ -62,7 +64,9 @@ function LoginPage() {
         displayName: String(user.display_name || user.email),
         role,
         organizationId,
-        organizationName: String(user.organization_name || organizationId),
+        organizationName: String(
+          user.organization_name || organizationId || "Global"
+        ),
         organizationPlan: billing.plan === "premium" ? "premium" : "free",
         isUpgraded: Boolean(billing.is_upgraded),
         loginAt: new Date().toISOString(),
@@ -150,6 +154,36 @@ function LoginPage() {
                         required
                       />
                     </div>
+                  </div>
+
+                  {/* Organization code field */}
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="login-organization-code"
+                      className="text-sm font-medium text-slate-100 flex items-center gap-2"
+                    >
+                      <Building2 className="w-4 h-4" />
+                      Organization Code
+                    </label>
+                    <div className="relative group">
+                      <input
+                        id="login-organization-code"
+                        type="text"
+                        value={loginForm.organizationCode}
+                        onChange={(e) =>
+                          setLoginForm({
+                            ...loginForm,
+                            organizationCode: e.target.value,
+                          })
+                        }
+                        className="w-full px-4 py-3 bg-slate-900/75 border border-slate-700 rounded-xl text-slate-100 placeholder:text-slate-400 focus:outline-none focus:border-cyan-400/70 focus:bg-slate-900 transition-all duration-300 backdrop-blur-sm group-hover:border-slate-500"
+                        placeholder="Optional organization code"
+                      />
+                    </div>
+                    <p className="text-xs text-slate-400">
+                      Use this only if the same email exists in multiple
+                      organizations.
+                    </p>
                   </div>
 
                   {/* Password field */}

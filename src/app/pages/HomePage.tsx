@@ -503,14 +503,14 @@ function HomePage() {
             ? "Syncing data"
             : `${overview.activeResidents} active`,
         },
-        {
-          label: "Faces Stored",
-          value: loading ? "Loading..." : overview.totalImages.toLocaleString(),
-          icon: Scan,
-          change: loading
-            ? "Syncing data"
-            : `${overview.totalFacesDetected} encodings`,
-        },
+        // {
+        //   label: "Faces Stored",
+        //   value: loading ? "Loading..." : overview.totalImages.toLocaleString(),
+        //   icon: Scan,
+        //   change: loading
+        //     ? "Syncing data"
+        //     : `${overview.totalFacesDetected} encodings`,
+        // },
         {
           label: "Safety Detections",
           value: loading

@@ -22,7 +22,9 @@ function syncBillingToSession(billing?: BillingPayload) {
 
 export function hasPremiumAccess() {
   const session = getAuthSession();
-  return session?.organizationPlan === "premium" || Boolean(session?.isUpgraded);
+  return (
+    session?.organizationPlan === "premium" || Boolean(session?.isUpgraded)
+  );
 }
 
 export async function fetchBillingStatus() {
@@ -46,6 +48,7 @@ export async function createCheckoutSession() {
       "Content-Type": "application/json",
       ...buildAuthHeaders(),
     },
+    body: JSON.stringify({ origin: window.location.origin }),
   });
   const result = await res.json();
 

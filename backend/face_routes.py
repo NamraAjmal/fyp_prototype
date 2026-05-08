@@ -43,14 +43,20 @@ def register_face_routes(app, deps):
     _check_delete_permission = deps["_check_delete_permission"]
     _check_capture_permission = deps["_check_capture_permission"]
 
-    # Encoding cache for better performance
+    # Encoding cache for better performance.
+    # Cache is keyed by organization scope to prevent cross-org matching.
     encoding_cache = {
-        "data": [],
-        "last_refresh": None,
+        "entries": {},
         "cache_duration_seconds": 300  # 5 minutes
     }
 
-    def _insert_resident_encoding_supabase(cnic: str, encoding_data: list, image_filename: str = None):
+    def _insert_resident_encoding_supabase(
+        cnic: str,
+        encoding_data: list,
+        image_filename: str = None,
+        company_id: str = None,
+        company_name: str = None,
+    ):
         """Insert face encoding for a resident into Supabase"""
         try:
             client = _get_supabase_client()
@@ -66,50 +72,112 @@ def register_face_routes(app, deps):
                 "cnic": cnic,
                 "encoding_data": encoding_data,
                 "image_filename": image_filename,
+                "organization_id": company_id,
+                "organization_name": company_name,
                 "created_at": datetime.utcnow().isoformat() + 'Z'
             }
             
-            result = client.table("resident_encodings").insert(data).execute()
+            try:
+                result = client.table("resident_encodings").insert(data).execute()
+            except Exception as first_err:
+                # Backward compatibility for schemas without org columns.
+                error_text = str(first_err).lower()
+                if 'organization_id' in error_text or 'organization_name' in error_text or 'column' in error_text:
+                    fallback = dict(data)
+                    fallback.pop('organization_id', None)
+                    fallback.pop('organization_name', None)
+                    result = client.table("resident_encodings").insert(fallback).execute()
+                else:
+                    raise
             logger.info(f"Successfully inserted encoding for {cnic} from {image_filename}")
             return result.data[0] if result.data else None
         except Exception as e:
             logger.exception(f"Failed to insert encoding for CNIC {cnic}: {str(e)}")
             return None
 
-    def _get_resident_encodings_supabase(cnic: str = None):
-        """Get face encodings from Supabase, optionally filtered by CNIC"""
+    def _get_resident_encodings_supabase(cnic: str = None, company_id: str = None, company_name: str = None):
+        """Get face encodings from Supabase, optionally filtered by CNIC and organization scope."""
         try:
             client = _get_supabase_client()
             if client is None:
                 logger.error("Supabase client not available")
                 return []
+
+            allowed_cnics = None
+            if company_id or company_name:
+                scoped_residents = _read_all_residents_supabase(company_id=company_id, company_name=company_name) or []
+                allowed_cnics = {
+                    str(resident.get('cnic') or '').strip()
+                    for resident in scoped_residents
+                    if str(resident.get('cnic') or '').strip()
+                }
+                if not allowed_cnics:
+                    return []
             
             query = client.table("resident_encodings").select("*")
             if cnic:
                 query = query.eq("cnic", cnic)
+            if company_id:
+                query = query.eq("organization_id", company_id)
+            elif company_name:
+                query = query.eq("organization_name", company_name)
             
-            result = query.execute()
+            try:
+                result = query.execute()
+            except Exception as query_err:
+                # Backward compatibility for schemas without org columns.
+                error_text = str(query_err).lower()
+                if (company_id or company_name) and (
+                    'organization_id' in error_text or 'organization_name' in error_text or 'column' in error_text
+                ):
+                    fallback_query = client.table("resident_encodings").select("*")
+                    if cnic:
+                        fallback_query = fallback_query.eq("cnic", cnic)
+                    result = fallback_query.execute()
+                else:
+                    raise
             encodings = result.data if result.data else []
-            logger.info(f"Retrieved {len(encodings)} encodings from database" + (f" for CNIC {cnic}" if cnic else ""))
+            if allowed_cnics is not None:
+                encodings = [
+                    row for row in encodings
+                    if str(row.get('cnic') or '').strip() in allowed_cnics
+                ]
+            logger.info(
+                f"Retrieved {len(encodings)} encodings from database"
+                + (f" for CNIC {cnic}" if cnic else "")
+                + (" (org scoped)" if (company_id or company_name) else "")
+            )
             return encodings
         except Exception as e:
             logger.exception("Failed to fetch resident encodings")
             return []
 
-    def _get_cached_encodings(force_refresh=False):
-        """Get encodings with caching for better performance"""
+    def _scope_cache_key(company_id: str = None, company_name: str = None) -> str:
+        if company_id:
+            return f"company_id:{company_id}"
+        if company_name:
+            return f"company_name:{company_name}"
+        return "global"
+
+    def _get_cached_encodings(force_refresh=False, company_id: str = None, company_name: str = None):
+        """Get encodings with caching for better performance, scoped per organization."""
         nonlocal encoding_cache
         now = datetime.now()
+        cache_key = _scope_cache_key(company_id=company_id, company_name=company_name)
+        cache_entry = encoding_cache["entries"].get(cache_key)
         
         if (force_refresh or 
-            encoding_cache["last_refresh"] is None or 
-            (now - encoding_cache["last_refresh"]).seconds > encoding_cache["cache_duration_seconds"]):
-            
-            encoding_cache["data"] = _get_resident_encodings_supabase()
-            encoding_cache["last_refresh"] = now
-            logger.info(f"Refreshed encoding cache with {len(encoding_cache['data'])} encodings")
+            cache_entry is None or
+            (now - cache_entry["last_refresh"]).seconds > encoding_cache["cache_duration_seconds"]):
+            data = _get_resident_encodings_supabase(company_id=company_id, company_name=company_name)
+            encoding_cache["entries"][cache_key] = {
+                "data": data,
+                "last_refresh": now,
+            }
+            logger.info(f"Refreshed encoding cache ({cache_key}) with {len(data)} encodings")
+            return data
         
-        return encoding_cache["data"]
+        return cache_entry["data"]
 
     def _delete_resident_encodings_supabase(cnic: str):
         """Delete all encodings for a resident"""
@@ -122,26 +190,27 @@ def register_face_routes(app, deps):
             client.table("resident_encodings").delete().eq("cnic", cnic).execute()
             logger.info(f"Deleted encodings for CNIC {cnic}")
             # Refresh cache after deletion
-            _get_cached_encodings(force_refresh=True)
+            # Clear all cache scopes so subsequent reads do not serve stale data.
+            encoding_cache["entries"] = {}
             return True
         except Exception as e:
             logger.exception(f"Failed to delete encodings for CNIC {cnic}")
             return False
 
-    def _get_resident_name_from_cnic(cnic):
+    def _get_resident_name_from_cnic(cnic, company_id=None, company_name=None):
         """Helper function to get resident name from CNIC"""
         try:
-            resident = _read_resident_supabase(cnic)
+            resident = _read_resident_supabase(cnic, company_id=company_id, company_name=company_name)
             return resident.get('name', 'Unknown') if resident else 'Unknown'
         except Exception as e:
             logger.exception(f"Error getting resident name for CNIC {cnic}")
             return 'Unknown'
 
-    def _find_duplicate_resident(embedding, threshold=0.6):
+    def _find_duplicate_resident(embedding, threshold=0.6, company_id: str = None, company_name: str = None):
         """Find matching resident by comparing with stored encodings"""
         try:
             # Get cached encodings from database
-            stored_encodings = _get_cached_encodings()
+            stored_encodings = _get_cached_encodings(company_id=company_id, company_name=company_name)
             
             if not stored_encodings:
                 logger.info("No stored encodings found in database")
@@ -175,7 +244,7 @@ def register_face_routes(app, deps):
                         best_match = {
                             "cnic": cnic,
                             "similarity": similarity,
-                            "name": _get_resident_name_from_cnic(cnic)
+                            "name": _get_resident_name_from_cnic(cnic, company_id=company_id, company_name=company_name)
                         }
             
             if best_match:
@@ -308,7 +377,7 @@ def register_face_routes(app, deps):
                     unmatched_count += 1
                     continue
 
-                match = _find_duplicate_resident(embedding)
+                match = _find_duplicate_resident(embedding, company_id=company_id)
                 if match:
                     face_results.append({
                         "bbox": face["bbox"], "confidence": face["confidence"],
@@ -412,7 +481,7 @@ def register_face_routes(app, deps):
                     unmatched_count += 1
                     continue
 
-                match = _find_duplicate_resident(embedding)
+                match = _find_duplicate_resident(embedding, company_id=company_id)
                 if match:
                     face_results.append({"bbox": face["bbox"], "confidence": face["confidence"], "matched": True, "name": match["name"], "cnic": match["cnic"], "similarity": match["similarity"]})
                     matched_count += 1
@@ -595,7 +664,11 @@ def register_face_routes(app, deps):
             images_folder = os.path.join(resident_folder, 'images')
 
             # Supabase is the source of truth for enrollment existence checks.
-            existing_resident = _read_resident_supabase(cnic)
+            existing_resident = _read_resident_supabase(
+                cnic,
+                company_id=organization_id,
+                company_name=organization_name,
+            )
             if existing_resident:
                 logger.error(f"CNIC already exists in Supabase: {cnic}")
                 return jsonify({"status": "error", "message": "This CNIC is already enrolled"}), 409
@@ -621,7 +694,7 @@ def register_face_routes(app, deps):
                         _delete_storage_paths_from_supabase(uploaded_storage_paths)
                     except Exception as storage_cleanup_err:
                         logger.warning(f"Failed storage cleanup: {str(storage_cleanup_err)}")
-                _delete_resident_supabase(cnic)
+                _delete_resident_supabase(cnic, company_id=organization_id, company_name=organization_name)
                 return jsonify({"status": "error", "message": message}), status_code
 
             # Create resident record in Supabase
@@ -732,7 +805,9 @@ def register_face_routes(app, deps):
                     encoding_result = _insert_resident_encoding_supabase(
                         cnic=cnic,
                         encoding_data=normalized_embedding,
-                        image_filename=filename
+                        image_filename=filename,
+                        company_id=organization_id,
+                        company_name=organization_name,
                     )
                     if encoding_result:
                         saved_encodings.append(encoding_result)
@@ -755,7 +830,9 @@ def register_face_routes(app, deps):
                         "file_size": os.path.getsize(filepath),
                         "storage_path": storage_result.get('storage_path') if storage_result else storage_path,
                         "public_url": storage_result.get('public_url') if storage_result else None,
-                        "cnic": cnic
+                        "cnic": cnic,
+                        "organization_id": organization_id,
+                        "organization_name": organization_name,
                     }
                     saved_images_metadata.append(image_metadata)
                     logger.info(f"✅ Uploaded {filename} to storage")
@@ -802,8 +879,8 @@ def register_face_routes(app, deps):
                 json.dump(profile_data_local, f, indent=2)
             logger.info(f"✅ Saved local profile data")
 
-            # Refresh encoding cache
-            _get_cached_encodings(force_refresh=True)
+            # Refresh scoped cache for this organization after enrollment.
+            _get_cached_encodings(force_refresh=True, company_id=organization_id, company_name=organization_name)
 
             logger.info(f"✅ Enrollment completed successfully. Encodings saved: {len(saved_encodings)}")
 
@@ -826,7 +903,7 @@ def register_face_routes(app, deps):
                     resident_folder = os.path.join(UPLOAD_FOLDER, cnic)
                     if os.path.exists(resident_folder):
                         shutil.rmtree(resident_folder, ignore_errors=True)
-                    _delete_resident_supabase(cnic)
+                    _delete_resident_supabase(cnic, company_id=organization_id, company_name=organization_name)
             except Exception as cleanup_err:
                 logger.error(f"Cleanup error: {str(cleanup_err)}")
             return jsonify({"status": "error", "message": error_msg}), 500
@@ -1045,7 +1122,7 @@ def register_face_routes(app, deps):
             storage_paths = [img.get('storage_path') or _resident_image_storage_path(cnic, img.get('filename', '')) for img in cloud_images if img.get('filename')]
 
             shutil.rmtree(resident_folder)
-            _delete_resident_supabase(cnic)
+            _delete_resident_supabase(cnic, company_id=company_id, company_name=company_name)
             _delete_resident_encodings_supabase(cnic)
             _delete_storage_paths_from_supabase(storage_paths)
 
@@ -1072,7 +1149,12 @@ def register_face_routes(app, deps):
             with open(profile_path, 'w') as f:
                 json.dump(pd, f, indent=2)
 
-            _update_resident_supabase(cnic, {"status": new_status, "updated_at": datetime.utcnow().isoformat() + 'Z'})
+            _update_resident_supabase(
+                cnic,
+                {"status": new_status, "updated_at": datetime.utcnow().isoformat() + 'Z'},
+                company_id=company_id,
+                company_name=company_name,
+            )
             return jsonify({"status": "success", "message": "Status updated successfully"})
         except Exception as e:
             logger.exception('update_resident_status error')
@@ -1109,7 +1191,12 @@ def register_face_routes(app, deps):
                 "city": pd['city'],
                 "updated_at": pd['updated_at']
             }
-            _update_resident_supabase(cnic, updates)
+            _update_resident_supabase(
+                cnic,
+                updates,
+                company_id=company_id,
+                company_name=company_name,
+            )
 
             return jsonify({"status": "success", "message": "Resident updated successfully"})
         except Exception as e:
@@ -1188,9 +1275,11 @@ def register_face_routes(app, deps):
             client = _get_supabase_client()
             supabase_status = "connected" if client else "disconnected"
             
+            cache_entries = encoding_cache.get("entries", {})
             cache_status = {
-                "encodings_cached": len(encoding_cache["data"]),
-                "last_refresh": encoding_cache["last_refresh"].isoformat() if encoding_cache["last_refresh"] else None
+                "scopes_cached": len(cache_entries),
+                "encodings_cached_total": sum(len(entry.get("data", [])) for entry in cache_entries.values()),
+                "scope_keys": list(cache_entries.keys())[:10],
             }
             
             return jsonify({

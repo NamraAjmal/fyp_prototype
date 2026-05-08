@@ -24,6 +24,29 @@ import { buildAuthHeaders } from "../../services/authSession";
 import { hasPremiumAccess } from "../../services/billingApi";
 
 const API_BASE = "http://127.0.0.1:5000";
+const CNIC_REGEX = /^\d{5}-\d{7}-\d{1}$/;
+const PAKISTANI_MOBILE_REGEX = /^0?3\d{9}$/;
+
+const normalizeDigits = (value: string) => value.replace(/\D/g, "");
+
+const normalizePakistaniPhone = (value: string) => {
+  const digits = normalizeDigits(value);
+
+  if (digits.startsWith("92") && digits.length > 11) {
+    return digits.slice(2);
+  }
+
+  if (digits.startsWith("0") && digits.length > 10) {
+    return digits.slice(1);
+  }
+
+  return digits;
+};
+
+const formatPakistaniPhoneForSave = (phoneNumber: string) => {
+  const normalized = normalizePakistaniPhone(phoneNumber);
+  return `+92 ${normalized}`.trim();
+};
 
 function buildResidentImageSrc(cnic: string, imagePath: string) {
   if (/^https?:\/\//i.test(imagePath)) return imagePath;
@@ -320,7 +343,7 @@ function EditModal({
   const [form, setForm] = useState({
     name: resident.name,
     email: resident.email,
-    phone: resident.phone,
+    phone: normalizePakistaniPhone(resident.phone),
     address: resident.address,
     city: resident.city,
   });
@@ -328,13 +351,28 @@ function EditModal({
   const [error, setError] = useState<string | null>(null);
 
   const handleSave = async () => {
+    if (!CNIC_REGEX.test(resident.cnic.trim())) {
+      setError("CNIC must be in the format 12345-1234567-1.");
+      return;
+    }
+
+    if (!PAKISTANI_MOBILE_REGEX.test(normalizeDigits(form.phone))) {
+      setError(
+        "Phone number must be a valid Pakistani mobile number, such as 3001234567 or 03001234567."
+      );
+      return;
+    }
+
     setSaving(true);
     setError(null);
     try {
       const res = await fetch(`${API_BASE}/update-resident/${resident.cnic}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          ...form,
+          phone: formatPakistaniPhoneForSave(form.phone),
+        }),
       });
       const result = await res.json();
       if (result.status === "success") {
@@ -377,34 +415,69 @@ function EditModal({
               {error}
             </p>
           )}
-          {(["name", "email", "phone", "address", "city"] as const).map(
-            (field) => (
-              <div key={field}>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
-                  {field}
-                </label>
-                {field === "address" ? (
-                  <textarea
-                    value={form[field]}
-                    onChange={(e) =>
-                      setForm({ ...form, [field]: e.target.value })
-                    }
-                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 resize-none transition-all text-sm text-slate-800"
-                    rows={2}
-                  />
-                ) : (
-                  <input
-                    type={field === "email" ? "email" : "text"}
-                    value={form[field]}
-                    onChange={(e) =>
-                      setForm({ ...form, [field]: e.target.value })
-                    }
-                    className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm text-slate-800"
-                  />
-                )}
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
+              name
+            </label>
+            <input
+              type="text"
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm text-slate-800"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
+              email
+            </label>
+            <input
+              type="email"
+              value={form.email}
+              onChange={(e) => setForm({ ...form, email: e.target.value })}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm text-slate-800"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
+              phone
+            </label>
+            <div className="grid grid-cols-[88px_1fr] gap-3">
+              <div className="flex items-center justify-center rounded-lg border border-slate-300 bg-slate-50 px-3 py-2.5 font-semibold text-slate-700 text-sm">
+                +92
               </div>
-            )
-          )}
+              <input
+                type="tel"
+                value={form.phone}
+                onChange={(e) => setForm({ ...form, phone: e.target.value })}
+                inputMode="numeric"
+                pattern="0?3[0-9]{9}"
+                placeholder="3001234567 or 03001234567"
+                className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm text-slate-800"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
+              address
+            </label>
+            <textarea
+              value={form.address}
+              onChange={(e) => setForm({ ...form, address: e.target.value })}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 resize-none transition-all text-sm text-slate-800"
+              rows={2}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5 capitalize">
+              city
+            </label>
+            <input
+              type="text"
+              value={form.city}
+              onChange={(e) => setForm({ ...form, city: e.target.value })}
+              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm text-slate-800"
+            />
+          </div>
         </div>
 
         <div className="flex justify-end gap-3 px-6 pb-6">

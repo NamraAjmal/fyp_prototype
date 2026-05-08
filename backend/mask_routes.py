@@ -365,7 +365,9 @@ def register_mask_routes(app, deps):
     @app.route('/mask-stats', methods=['GET'])
     def mask_stats():
         try:
-            logs = read_mask_logs()
+            company_id = (request.headers.get('X-Company-ID') or '').strip() or None
+            company_name = (request.headers.get('X-Company-Name') or '').strip() or None
+            logs = read_mask_logs(company_id=company_id, company_name=company_name)
             summary = summarize_mask_logs(logs)
             today_prefix = datetime.utcnow().date().isoformat()
             violations_today = sum(1 for l in logs if l.get('status') == 'Non-Compliant' and str(l.get('timestamp', '')).startswith(today_prefix))

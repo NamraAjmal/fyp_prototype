@@ -30,6 +30,15 @@ const bufferToHex = (buffer: ArrayBuffer) =>
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
+const PAKISTAN_CODE = "+92";
+const CNIC_REGEX = /^\d{5}-\d{7}-\d{1}$/;
+const PAKISTANI_MOBILE_REGEX = /^0?3\d{9}$/;
+
+const normalizeDigits = (value: string) => value.replace(/\D/g, "");
+
+const buildPhoneValue = (phoneNumber: string) =>
+  `${PAKISTAN_CODE} ${phoneNumber}`.trim();
+
 function ResidentEnrollmentPage() {
   const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
@@ -51,7 +60,7 @@ function ResidentEnrollmentPage() {
     cnic: "",
     name: "",
     email: "",
-    phone: "",
+    phoneNumber: "",
     address: "",
     city: "",
     images: [] as File[],
@@ -111,6 +120,42 @@ function ResidentEnrollmentPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    if (!CNIC_REGEX.test(formData.cnic.trim())) {
+      setModalData({
+        success: false,
+        message: "CNIC must be in the format 12345-1234567-1.",
+        name: "",
+        cnic: "",
+        email: "",
+        phone: "",
+        address: "",
+        city: "",
+        imagesCount: 0,
+        imageUrls: [],
+      });
+      setShowModal(true);
+      return;
+    }
+
+    const normalizedPhoneNumber = normalizeDigits(formData.phoneNumber.trim());
+    if (!PAKISTANI_MOBILE_REGEX.test(normalizedPhoneNumber)) {
+      setModalData({
+        success: false,
+        message:
+          "Phone number must be a valid Pakistani mobile number, such as 3001234567 or 03001234567.",
+        name: "",
+        cnic: "",
+        email: "",
+        phone: "",
+        address: "",
+        city: "",
+        imagesCount: 0,
+        imageUrls: [],
+      });
+      setShowModal(true);
+      return;
+    }
+
     const imageValidationError = await validateSelectedImages(formData.images);
     if (imageValidationError) {
       setModalData({
@@ -132,10 +177,14 @@ function ResidentEnrollmentPage() {
     setLoading(true);
 
     const data = new FormData();
+    const normalizedMobileNumber = normalizedPhoneNumber.startsWith("0")
+      ? normalizedPhoneNumber.slice(1)
+      : normalizedPhoneNumber;
+    const phoneValue = buildPhoneValue(normalizedMobileNumber);
     data.append("cnic", formData.cnic);
     data.append("name", formData.name);
     data.append("email", formData.email);
-    data.append("phone", formData.phone);
+    data.append("phone", phoneValue);
     data.append("address", formData.address);
     data.append("city", formData.city);
 
@@ -184,7 +233,7 @@ function ResidentEnrollmentPage() {
             name: formData.name,
             cnic: formData.cnic,
             email: formData.email,
-            phone: formData.phone,
+            phone: phoneValue,
             address: formData.address,
             city: formData.city,
             imagesCount:
@@ -198,7 +247,7 @@ function ResidentEnrollmentPage() {
             cnic: "",
             name: "",
             email: "",
-            phone: "",
+            phoneNumber: "",
             address: "",
             city: "",
             images: [],
@@ -412,24 +461,32 @@ function ResidentEnrollmentPage() {
               />
             </div>
             <div>
-              <label
-                htmlFor="phone"
-                className="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2"
-              >
+              <label className="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
                 <Phone className="w-4 h-4" />
                 Phone Number
               </label>
-              <input
-                id="phone"
-                type="tel"
-                value={formData.phone}
-                onChange={(e) =>
-                  setFormData({ ...formData, phone: e.target.value })
-                }
-                className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all"
-                placeholder="+92 300 1234567"
-                required
-              />
+              <div className="grid grid-cols-[88px_1fr] gap-3">
+                <div className="flex items-center justify-center rounded-lg border border-slate-300 bg-slate-50 px-3 py-3 font-semibold text-slate-700">
+                  +92
+                </div>
+                <input
+                  id="phone"
+                  type="tel"
+                  value={formData.phoneNumber}
+                  onChange={(e) =>
+                    setFormData({ ...formData, phoneNumber: e.target.value })
+                  }
+                  inputMode="numeric"
+                  pattern="0?3[0-9]{9}"
+                  className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all"
+                  placeholder="3001234567 or 03001234567"
+                  required
+                />
+              </div>
+              {/* <p className="mt-2 text-xs text-slate-500">
+                Pakistani mobile numbers only. The saved format will be +92
+                followed by the mobile number.
+              </p> */}
             </div>
           </div>
 
