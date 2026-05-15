@@ -504,8 +504,10 @@ function HomePage() {
             : `${overview.activeResidents} active`,
         },
         {
-          label: "Faces Stored",
-          value: loading ? "Loading..." : overview.totalImages.toLocaleString(),
+          label: "Resident Encodings",
+          value: loading
+            ? "Loading..."
+            : overview.totalFacesDetected.toLocaleString(),
           icon: Scan,
           change: loading
             ? "Syncing data"

@@ -528,6 +528,25 @@ def _count_resident_images_supabase(company_id=None, company_name=None):
         logger.exception('Failed to count resident images')
         return 0
 
+
+def _count_resident_encodings_supabase(company_id=None, company_name=None):
+    client = _get_supabase_client()
+    if client is None:
+        return 0
+
+    try:
+        query = client.table('resident_encodings').select('id', count='exact')
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+
+        result = query.limit(1).execute()
+        return int(getattr(result, 'count', 0) or 0)
+    except Exception:
+        logger.exception('Failed to count resident encodings')
+        return 0
+
 def _generate_unique_org_code():
     """Generate a random 6-character unique organization code."""
     import random
