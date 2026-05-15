@@ -509,6 +509,25 @@ def _organization_member_count(organization_id):
         logger.exception('Failed to count organization members')
         return 0
 
+
+def _count_resident_images_supabase(company_id=None, company_name=None):
+    client = _get_supabase_client()
+    if client is None:
+        return 0
+
+    try:
+        query = client.table(SUPABASE_RESIDENT_IMAGES_TABLE).select('id', count='exact')
+        if company_id:
+            query = query.eq('organization_id', company_id)
+        elif company_name:
+            query = query.eq('organization_name', company_name)
+
+        result = query.limit(1).execute()
+        return int(getattr(result, 'count', 0) or 0)
+    except Exception:
+        logger.exception('Failed to count resident images')
+        return 0
+
 def _generate_unique_org_code():
     """Generate a random 6-character unique organization code."""
     import random
@@ -2465,6 +2484,11 @@ def dashboard_overview():
                             active_res += 1
                         if str(resident.get('enrolled_at', '')).startswith(today_prefix):
                             enrollments_today += 1
+
+                    if total_images == 0:
+                        total_images = _count_resident_images_supabase(company_id=company_id, company_name=company_name)
+                    if total_faces == 0:
+                        total_faces = _count_resident_images_supabase(company_id=company_id, company_name=company_name)
             except Exception:
                 logger.exception("dashboard_overview resident fetch error")
 
