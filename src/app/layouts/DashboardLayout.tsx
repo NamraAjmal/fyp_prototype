@@ -430,7 +430,7 @@ function DashboardLayout() {
               <button
                 onClick={handleUpgrade}
                 disabled={upgradeLoading}
-                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-cyan-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-cyan-700 disabled:opacity-60"
+                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-cyan-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-cyan-700 disabled:opacity-60 cursor-pointer"
               >
                 {upgradeLoading ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
