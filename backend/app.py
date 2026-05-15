@@ -2506,8 +2506,10 @@ def dashboard_overview():
 
                     if total_images == 0:
                         total_images = _count_resident_images_supabase(company_id=company_id, company_name=company_name)
+                    # Prefer explicit resident row count for faces, fallback to encodings table when missing
+                    resident_encodings_count = _count_resident_encodings_supabase(company_id=company_id, company_name=company_name)
                     if total_faces == 0:
-                        total_faces = _count_resident_images_supabase(company_id=company_id, company_name=company_name)
+                        total_faces = resident_encodings_count
             except Exception:
                 logger.exception("dashboard_overview resident fetch error")
 
@@ -2537,6 +2539,7 @@ def dashboard_overview():
                 "activeResidents":       active_res,
                 "totalImages":           total_images,
                 "totalFacesDetected":    total_faces,
+                "residentEncodings":    resident_encodings_count if 'resident_encodings_count' in locals() else 0,
                 "enrollmentsToday":      enrollments_today,
                 "helmetDetectionsTotal": len(helmet_logs_data),
                 "helmetDetectionsToday": helmet_today,
