@@ -172,7 +172,9 @@ import { buildAuthHeaders } from "./authSession";
 // }
 
 // services/maskApi.ts
-const API_BASE = "http://localhost:5000";
+const API_BASE =
+  (import.meta as { env?: Record<string, string> }).env?.VITE_API_BASE_URL ||
+  "http://127.0.0.1:5000";
 
 export type MaskLog = {
   id: number;

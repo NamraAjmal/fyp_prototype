@@ -161,6 +161,8 @@ def register_helmet_routes(app, deps):
             location = request.args.get('location', 'all')
             status = request.args.get('status', 'all')
             source = request.args.get('source', 'all')
+            start_time = request.args.get('start_time')
+            end_time = request.args.get('end_time')
 
             filtered = logs
             if location != 'all':
@@ -169,6 +171,10 @@ def register_helmet_routes(app, deps):
                 filtered = [l for l in filtered if l.get('status') == status]
             if source != 'all':
                 filtered = [l for l in filtered if l.get('source') == source]
+            if start_time:
+                filtered = [l for l in filtered if str(l.get('timestamp', '')) >= str(start_time)]
+            if end_time:
+                filtered = [l for l in filtered if str(l.get('timestamp', '')) <= str(end_time)]
 
             filtered = sorted(filtered, key=lambda x: x.get('timestamp', ''), reverse=True)
             total = len(filtered)
