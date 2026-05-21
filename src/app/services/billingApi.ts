@@ -50,7 +50,10 @@ export async function createCheckoutSession() {
       "Content-Type": "application/json",
       ...buildAuthHeaders(),
     },
-    body: JSON.stringify({ origin: window.location.origin }),
+    body: JSON.stringify({
+      origin: window.location.origin,
+      return_to: window.location.pathname + window.location.search,
+    }),
   });
   const result = await res.json();
 

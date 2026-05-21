@@ -2173,13 +2173,14 @@ def billing_create_checkout_session():
     try:
         payload = request.get_json(silent=True) or {}
         requested_origin = (payload.get('origin') or '').strip()
+        requested_return_to = (payload.get('return_to') or '').strip()
         # Normalize/validate origin
         if requested_origin and (requested_origin.startswith('http://') or requested_origin.startswith('https://')):
             frontend_origin = requested_origin.rstrip('/')
         else:
             frontend_origin = FRONTEND_BASE_URL
 
-        logger.info(f'Using frontend origin for checkout: {frontend_origin}')
+        logger.info(f'Using frontend origin for checkout: {frontend_origin} return_to={requested_return_to}')
 
         actor = _request_actor_user()
         if not actor:
@@ -2206,6 +2207,29 @@ def billing_create_checkout_session():
         if not STRIPE_SECRET_KEY or not STRIPE_UPGRADE_PRICE_ID:
             return jsonify({"status": "error", "message": "Stripe is not configured. Set STRIPE_SECRET_KEY and STRIPE_UPGRADE_PRICE_ID."}), 500
 
+        # Normalize return path: must be a relative path starting with '/'
+        return_path = '/'
+        if requested_return_to:
+            if requested_return_to.startswith('/'):
+                return_path = requested_return_to
+            else:
+                # Guard: avoid open redirect by stripping any origin if accidentally included
+                try:
+                    # If value looks like a URL, extract path+query
+                    from urllib.parse import urlparse
+                    parsed = urlparse(requested_return_to)
+                    if parsed.path:
+                        return_path = parsed.path + (('?' + parsed.query) if parsed.query else '')
+                except Exception:
+                    return_path = '/'
+
+        # Build success/cancel URLs using the provided return path
+        def _append_param(url, key, value):
+            return url + (('&' if '?' in url else '?') + f"{key}={value}")
+
+        success_base = f"{frontend_origin}{return_path}"
+        cancel_base = f"{frontend_origin}{return_path}"
+
         checkout_session = stripe.checkout.Session.create(
             mode="subscription",
             payment_method_types=["card"],
@@ -2222,8 +2246,8 @@ def billing_create_checkout_session():
                     "owner_email": str(actor.get('email') or ''),
                 }
             },
-            success_url=f"{frontend_origin}/dashboard?upgrade=success&session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{frontend_origin}/dashboard?upgrade=cancelled",
+            success_url=_append_param(success_base, 'upgrade', 'success').replace(' ', '%20') + '&session_id={CHECKOUT_SESSION_ID}',
+            cancel_url=_append_param(cancel_base, 'upgrade', 'cancelled').replace(' ', '%20'),
         )
 
         logger.info(f'Checkout session created: id={getattr(checkout_session, "id", None)} url={getattr(checkout_session, "url", None)}')
